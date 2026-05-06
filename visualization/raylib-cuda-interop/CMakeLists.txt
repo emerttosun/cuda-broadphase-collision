@@ -55,6 +55,10 @@ target_link_libraries(raylib_cuda_visualizer PRIVATE
     raylib
 )
 
+if(WIN32)
+    target_link_libraries(raylib_cuda_visualizer PRIVATE winmm opengl32)
+endif()
+
 set_target_properties(raylib_cuda_visualizer PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES "${CMP674_CUDA_ARCHITECTURES}"

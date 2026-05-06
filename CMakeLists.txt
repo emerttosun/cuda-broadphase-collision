@@ -35,6 +35,7 @@ target_include_directories(cmp674_core PUBLIC
 
 set_target_properties(cmp674_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CUDA_ARCHITECTURES "${CMP674_CUDA_ARCHITECTURES}"
     POSITION_INDEPENDENT_CODE ON
 )
@@ -56,6 +57,13 @@ add_executable(collision_benchmark
 )
 
 target_link_libraries(collision_benchmark PRIVATE cmp674_core)
+
+set_target_properties(collision_benchmark PROPERTIES
+    LINKER_LANGUAGE CUDA
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    CUDA_ARCHITECTURES "${CMP674_CUDA_ARCHITECTURES}"
+)
 
 # ---------------------------------------------------------------------------
 # Optional live visualizer (raylib + CUDA-OpenGL interop). Off by default
