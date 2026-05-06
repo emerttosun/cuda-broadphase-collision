@@ -74,7 +74,14 @@ The default dense cell threshold is `128`. Dense cell optimization is not implem
 include/                       # Public headers (data types + algorithms)
 src/                           # Shared core implementation + benchmark binary
 visualization/raylib-cuda-interop/   # Optional live visualizer (raylib + CUDA)
+docs/                          # Project review and development roadmap
 ```
+
+A long-form project review, current-state critique, parallelization
+techniques and the literature-backed development roadmap (LBVH, spatial
+hashing, sweep-and-prune, RT-core paths, profiling and presentation
+guidelines) live in
+[`docs/REVIEW_AND_ROADMAP.md`](docs/REVIEW_AND_ROADMAP.md).
 
 The build is driven by a single root `CMakeLists.txt` that produces:
 
