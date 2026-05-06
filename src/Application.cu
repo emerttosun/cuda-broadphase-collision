@@ -11,8 +11,26 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <GL/gl.h>
+
+// Undefine Windows macros that conflict with Raylib
+#if defined(DrawText)
+#undef DrawText
+#endif
+#if defined(CloseWindow)
+#undef CloseWindow
+#endif
+#if defined(Rectangle)
+#undef Rectangle
+#endif
+#if defined(ShowCursor)
+#undef ShowCursor
+#endif
+
 #endif
 
 #include <cuda_gl_interop.h>
@@ -41,6 +59,11 @@ static std::unique_ptr<ICollisionDetector> g_detector;
 static cudaGraphicsResource* g_vbo_resource = nullptr;
 static unsigned int g_vao = 0;
 static unsigned int g_vbo = 0;
+
+// Device memory for zero-copy rendering
+static float* g_d_x = nullptr;
+static float* g_d_y = nullptr;
+static float* g_d_r = nullptr;
 
 static const char* kVertexShader =
     "#version 330 core\n"
@@ -184,6 +207,10 @@ int run_application(int argc, char** argv) {
 
     cudaGraphicsGLRegisterBuffer(&g_vbo_resource, g_vbo, cudaGraphicsMapFlagsWriteDiscard);
 
+    cudaMalloc(&g_d_x, g_object_count * sizeof(float));
+    cudaMalloc(&g_d_y, g_object_count * sizeof(float));
+    cudaMalloc(&g_d_r, g_object_count * sizeof(float));
+
     reset_simulation();
     switch_detector(Method::CUDA_LBVH);
 
@@ -215,23 +242,15 @@ int run_application(int argc, char** argv) {
                 cudaGraphicsMapResources(1, &g_vbo_resource, 0);
                 cudaGraphicsResourceGetMappedPointer((void**)&d_vertices, &mapped_size, g_vbo_resource);
                 
-                // Hack: We need device pointers from the detector, but we can just use the fact that 
-                // g_circles has device pointers if we mapped them, or just upload to a quick local buffer
-                // For a perfect SoA zero-copy we write VBO kernel here.
-                float *d_x, *d_y, *d_r;
-                cudaMalloc(&d_x, g_object_count * sizeof(float));
-                cudaMalloc(&d_y, g_object_count * sizeof(float));
-                cudaMalloc(&d_r, g_object_count * sizeof(float));
-                cudaMemcpy(d_x, g_circles.host_x.data(), g_object_count * sizeof(float), cudaMemcpyHostToDevice);
-                cudaMemcpy(d_y, g_circles.host_y.data(), g_object_count * sizeof(float), cudaMemcpyHostToDevice);
-                cudaMemcpy(d_r, g_circles.host_radius.data(), g_object_count * sizeof(float), cudaMemcpyHostToDevice);
+                // Copy data to device for VBO kernel
+                cudaMemcpy(g_d_x, g_circles.host_x.data(), g_object_count * sizeof(float), cudaMemcpyHostToDevice);
+                cudaMemcpy(g_d_y, g_circles.host_y.data(), g_object_count * sizeof(float), cudaMemcpyHostToDevice);
+                cudaMemcpy(g_d_r, g_circles.host_radius.data(), g_object_count * sizeof(float), cudaMemcpyHostToDevice);
 
                 int blocks = (g_object_count + 255) / 256;
-                write_vbo_kernel_soa<<<blocks, 256>>>(d_x, d_y, d_r, d_vertices, g_object_count, kWindowWidth, kWindowHeight);
+                write_vbo_kernel_soa<<<blocks, 256>>>(g_d_x, g_d_y, g_d_r, d_vertices, g_object_count, kWindowWidth, kWindowHeight);
 
                 cudaGraphicsUnmapResources(1, &g_vbo_resource, 0);
-                
-                cudaFree(d_x); cudaFree(d_y); cudaFree(d_r);
             }
         }
 
@@ -260,6 +279,9 @@ int run_application(int argc, char** argv) {
     }
 
     cudaGraphicsUnregisterResource(g_vbo_resource);
+    cudaFree(g_d_x);
+    cudaFree(g_d_y);
+    cudaFree(g_d_r);
     rlUnloadVertexBuffer(g_vbo);
     rlUnloadVertexArray(g_vao);
     rlUnloadShaderProgram(particle_shader);
