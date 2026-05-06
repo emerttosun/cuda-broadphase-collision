@@ -13,15 +13,10 @@ else()
     set(CMP674_CUDA_ARCHITECTURES "60;61;70;75;80;86;89" CACHE STRING "CUDA architectures for CMP674 targets")
 endif()
 
-# Fetch Raylib
-include(FetchContent)
-FetchContent_Declare(
-    raylib
-    URL https://github.com/raysan5/raylib/archive/refs/tags/5.0.tar.gz
-)
+# Raylib Submodule
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(raylib)
+add_subdirectory(external/raylib)
 
 add_executable(collision_benchmark
     src/main.cpp

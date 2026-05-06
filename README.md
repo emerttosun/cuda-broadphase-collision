@@ -52,11 +52,15 @@ The CSV output is written to `results/timings.csv`.
 
 ## Build With CMake
 
-The project uses CMake and automatically downloads Raylib via `FetchContent`.
+The project uses CMake and includes Raylib as a Git submodule.
 
 On a CUDA-capable machine (Linux, Windows, WSL2, or Colab):
 
 ```bash
+# Clone the repository with submodules
+git clone --recursive https://github.com/emerttosun/CMP674.git
+cd CMP674
+
 mkdir build
 # cd build
 cmake -B build
@@ -80,7 +84,7 @@ You can run the benchmark headless on Google Colab to gather data using a high-e
 ```python
 !nvidia-smi
 !nvcc --version
-!git clone https://github.com/emerttosun/CMP674.git collision-cuda-project
+!git clone --recursive https://github.com/emerttosun/CMP674.git collision-cuda-project
 %cd collision-cuda-project
 !cmake -B build
 !cmake --build build -j2
