@@ -119,7 +119,7 @@ cmake --build --preset benchmark-only
 
 - `Space` — pause / resume
 - `C` — uniform / clustered dağılım
-- `G` — mod değiştir (CUDA brute force → CUDA uniform grid → CPU brute force)
+- `G` — mod değiştir (CUDA brute force → CUDA uniform grid → CPU brute force → CUDA LBVH)
 - `+` / `-` — obje sayısını ±500 değiştir (sınırlar: 100..20000)
 - `R` — reset
 - `Esc` — çıkış

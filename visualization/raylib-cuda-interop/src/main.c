@@ -72,6 +72,7 @@ static const char* mode_name(int mode) {
     switch (mode) {
         case VISUALIZER_MODE_CUDA_UNIFORM_GRID: return "cuda_uniform_grid";
         case VISUALIZER_MODE_CPU_BRUTE_FORCE:   return "cpu_brute_force";
+        case VISUALIZER_MODE_CUDA_LBVH:         return "cuda_lbvh";
         default:                                return "cuda_brute_force";
     }
 }
@@ -135,7 +136,7 @@ int main(int argc, char** argv) {
             cuda_visualizer_reset(clustered);
         }
         if (IsKeyPressed(KEY_G)) {
-            mode = (mode + 1) % 3;
+            mode = (mode + 1) % 4;
             cuda_visualizer_set_mode(mode);
         }
 

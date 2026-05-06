@@ -44,6 +44,16 @@ static int* g_cell_keys = NULL;
 static int* g_indices = NULL;
 static int* g_cell_start = NULL;
 static int* g_cell_end = NULL;
+static unsigned int* g_lbvh_morton = NULL;
+static int* g_lbvh_indices = NULL;
+static float* g_lbvh_aabb_min_x = NULL;
+static float* g_lbvh_aabb_min_y = NULL;
+static float* g_lbvh_aabb_max_x = NULL;
+static float* g_lbvh_aabb_max_y = NULL;
+static int* g_lbvh_parent = NULL;
+static int* g_lbvh_left = NULL;
+static int* g_lbvh_right = NULL;
+static int* g_lbvh_flags = NULL;
 static cudaGraphicsResource* g_vbo_resource = NULL;
 static cudaEvent_t g_start_event = NULL;
 static cudaEvent_t g_stop_event = NULL;
@@ -245,6 +255,223 @@ __global__ static void grid_collision_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// LBVH (Karras 2012) — Morton codes + parallel radix tree + AABB traversal.
+// Tree layout: N leaves at indices [N-1 .. 2N-2], N-1 internal nodes at
+// [0 .. N-2], root = node 0. Sized arrays therefore have 2N-1 entries.
+// ---------------------------------------------------------------------------
+
+__device__ static unsigned int lbvh_expand_bits(unsigned int v) {
+    v = (v * 0x00010001u) & 0xFF0000FFu;
+    v = (v * 0x00000101u) & 0x0F00F00Fu;
+    v = (v * 0x00000011u) & 0xC30C30C3u;
+    v = (v * 0x00000005u) & 0x49249249u;
+    return v;
+}
+
+__device__ static unsigned int lbvh_morton2d(float x, float y, float scene_w, float scene_h) {
+    float fx = x / scene_w;
+    float fy = y / scene_h;
+    fx = fmaxf(0.0f, fminf(fx * 32768.0f, 32767.0f));
+    fy = fmaxf(0.0f, fminf(fy * 32768.0f, 32767.0f));
+    const unsigned int xx = lbvh_expand_bits((unsigned int)fx);
+    const unsigned int yy = lbvh_expand_bits((unsigned int)fy);
+    return xx * 2u + yy;
+}
+
+__device__ static int lbvh_common_upper_bits(const unsigned int* morton_codes, int count, int i, int j) {
+    if (j < 0 || j >= count) {
+        return -1;
+    }
+    const unsigned int code_i = morton_codes[i];
+    const unsigned int code_j = morton_codes[j];
+    if (code_i == code_j) {
+        return 32 + __clz((unsigned int)(i ^ j));
+    }
+    return __clz(code_i ^ code_j);
+}
+
+__global__ static void lbvh_morton_kernel(
+    const DeviceBall* balls,
+    unsigned int* morton_codes,
+    int* indices,
+    int count,
+    float scene_w,
+    float scene_h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    morton_codes[i] = lbvh_morton2d(balls[i].x, balls[i].y, scene_w, scene_h);
+    indices[i] = i;
+}
+
+__global__ static void lbvh_build_radix_tree_kernel(
+    const unsigned int* morton_codes,
+    int count,
+    int* parent,
+    int* left_child,
+    int* right_child) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count - 1) {
+        return;
+    }
+
+    const int d = (lbvh_common_upper_bits(morton_codes, count, i, i + 1)
+                   > lbvh_common_upper_bits(morton_codes, count, i, i - 1)) ? 1 : -1;
+
+    const int min_delta = lbvh_common_upper_bits(morton_codes, count, i, i - d);
+    int lmax = 2;
+    while (lbvh_common_upper_bits(morton_codes, count, i, i + lmax * d) > min_delta) {
+        lmax *= 2;
+    }
+
+    int l = 0;
+    for (int t = lmax / 2; t >= 1; t /= 2) {
+        if (lbvh_common_upper_bits(morton_codes, count, i, i + (l + t) * d) > min_delta) {
+            l += t;
+        }
+    }
+    const int j = i + l * d;
+
+    const int delta_node = lbvh_common_upper_bits(morton_codes, count, i, j);
+    int s = 0;
+    int t_step = l;
+    do {
+        t_step = (t_step + 1) / 2;
+        if (lbvh_common_upper_bits(morton_codes, count, i, i + (s + t_step) * d) > delta_node) {
+            s += t_step;
+        }
+        if (t_step <= 1) {
+            break;
+        }
+    } while (true);
+
+    const int split = i + s * d + min(d, 0);
+    const int left = (min(i, j) == split) ? (count - 1 + split) : split;
+    const int right = (max(i, j) == split + 1) ? (count - 1 + split + 1) : (split + 1);
+
+    left_child[i] = left;
+    right_child[i] = right;
+    parent[left] = i;
+    parent[right] = i;
+}
+
+__global__ static void lbvh_aabbs_kernel(
+    const DeviceBall* balls,
+    const int* indices,
+    int count,
+    const int* parent,
+    const int* left_child,
+    const int* right_child,
+    int* flags,
+    float* aabb_min_x,
+    float* aabb_min_y,
+    float* aabb_max_x,
+    float* aabb_max_y) {
+    const int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leaf_idx >= count) {
+        return;
+    }
+
+    const int node_idx = count - 1 + leaf_idx;
+    const int obj_idx = indices[leaf_idx];
+    const float cx = balls[obj_idx].x;
+    const float cy = balls[obj_idx].y;
+    const float rad = balls[obj_idx].radius;
+
+    aabb_min_x[node_idx] = cx - rad;
+    aabb_min_y[node_idx] = cy - rad;
+    aabb_max_x[node_idx] = cx + rad;
+    aabb_max_y[node_idx] = cy + rad;
+    // Publish leaf AABB to other threads before signalling via the flag.
+    // CUDA atomics are relaxed by default; without this fence the second
+    // arrival at the parent may read stale child AABBs and produce a
+    // garbage tree, devolving traversal into brute force.
+    __threadfence();
+
+    int current = parent[node_idx];
+    while (current >= 0) {
+        const int old = atomicAdd(&flags[current], 1);
+        if (old == 0) {
+            return;
+        }
+        const int l = left_child[current];
+        const int r = right_child[current];
+        aabb_min_x[current] = fminf(aabb_min_x[l], aabb_min_x[r]);
+        aabb_min_y[current] = fminf(aabb_min_y[l], aabb_min_y[r]);
+        aabb_max_x[current] = fmaxf(aabb_max_x[l], aabb_max_x[r]);
+        aabb_max_y[current] = fmaxf(aabb_max_y[l], aabb_max_y[r]);
+        __threadfence();
+        current = parent[current];
+    }
+}
+
+__global__ static void lbvh_traverse_kernel(
+    DeviceBall* balls,
+    const int* indices,
+    int count,
+    const int* left_child,
+    const int* right_child,
+    const float* aabb_min_x,
+    const float* aabb_min_y,
+    const float* aabb_max_x,
+    const float* aabb_max_y,
+    unsigned long long* collision_count,
+    unsigned long long* candidate_pair_count) {
+    const int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leaf_idx >= count) {
+        return;
+    }
+
+    const int obj_idx = indices[leaf_idx];
+    const DeviceBall self = balls[obj_idx];
+    const float my_min_x = self.x - self.radius;
+    const float my_min_y = self.y - self.radius;
+    const float my_max_x = self.x + self.radius;
+    const float my_max_y = self.y + self.radius;
+    const Circle self_circle = ball_to_circle(&self);
+
+    int stack[64];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    unsigned long long local_collisions = 0;
+    unsigned long long local_candidates = 0;
+
+    while (stack_ptr > 0) {
+        const int node = stack[--stack_ptr];
+        if (my_max_x < aabb_min_x[node] || my_min_x > aabb_max_x[node]
+            || my_max_y < aabb_min_y[node] || my_min_y > aabb_max_y[node]) {
+            continue;
+        }
+        if (node >= count - 1) {
+            const int other_leaf = node - (count - 1);
+            if (other_leaf > leaf_idx) {
+                ++local_candidates;
+                const int other_obj = indices[other_leaf];
+                const DeviceBall other = balls[other_obj];
+                const Circle other_circle = ball_to_circle(&other);
+                if (circles_overlap(&self_circle, &other_circle)) {
+                    balls[obj_idx].colliding = 1;
+                    balls[other_obj].colliding = 1;
+                    ++local_collisions;
+                }
+            }
+        } else {
+            stack[stack_ptr++] = left_child[node];
+            stack[stack_ptr++] = right_child[node];
+        }
+    }
+
+    if (local_candidates > 0) {
+        atomicAdd(candidate_pair_count, local_candidates);
+    }
+    if (local_collisions > 0) {
+        atomicAdd(collision_count, local_collisions);
+    }
+}
+
 __global__ static void write_vbo_kernel(
     const DeviceBall* balls,
     RenderVertex* vertices,
@@ -432,6 +659,47 @@ static void run_uniform_grid(int blocks, int threads) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+static void run_lbvh(int blocks, int threads) {
+    const int num_nodes = 2 * g_object_count - 1;
+
+    CUDA_CHECK(cudaMemset(g_lbvh_flags, 0, (size_t)num_nodes * sizeof(int)));
+    // parent[0] (root) is never written by build_radix_tree; mark every parent
+    // slot as -1 so the bottom-up walk terminates cleanly at the root.
+    CUDA_CHECK(cudaMemset(g_lbvh_parent, 0xFF, (size_t)num_nodes * sizeof(int)));
+
+    lbvh_morton_kernel<<<blocks, threads>>>(
+        g_balls, g_lbvh_morton, g_lbvh_indices,
+        g_object_count, (float)g_width, (float)g_height);
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::device_ptr<unsigned int> morton_ptr(g_lbvh_morton);
+    thrust::device_ptr<int> indices_ptr(g_lbvh_indices);
+    thrust::sort_by_key(morton_ptr, morton_ptr + g_object_count, indices_ptr);
+
+    const int internal_blocks = ((g_object_count - 1) + threads - 1) / threads;
+    if (internal_blocks > 0) {
+        lbvh_build_radix_tree_kernel<<<internal_blocks, threads>>>(
+            g_lbvh_morton, g_object_count,
+            g_lbvh_parent, g_lbvh_left, g_lbvh_right);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    lbvh_aabbs_kernel<<<blocks, threads>>>(
+        g_balls, g_lbvh_indices, g_object_count,
+        g_lbvh_parent, g_lbvh_left, g_lbvh_right, g_lbvh_flags,
+        g_lbvh_aabb_min_x, g_lbvh_aabb_min_y,
+        g_lbvh_aabb_max_x, g_lbvh_aabb_max_y);
+    CUDA_CHECK(cudaGetLastError());
+
+    lbvh_traverse_kernel<<<blocks, threads>>>(
+        g_balls, g_lbvh_indices, g_object_count,
+        g_lbvh_left, g_lbvh_right,
+        g_lbvh_aabb_min_x, g_lbvh_aabb_min_y,
+        g_lbvh_aabb_max_x, g_lbvh_aabb_max_y,
+        g_collision_count, g_candidate_pair_count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int width, int height) {
     g_object_count = object_count;
     g_width = width;
@@ -451,6 +719,19 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     CUDA_CHECK(cudaMalloc((void**)&g_indices, (size_t)object_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_cell_start, (size_t)g_total_cells * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_cell_end, (size_t)g_total_cells * sizeof(int)));
+
+    const size_t lbvh_nodes = (size_t)object_count * 2 - 1;
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_morton, (size_t)object_count * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_indices, (size_t)object_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_min_x, lbvh_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_min_y, lbvh_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_max_x, lbvh_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_max_y, lbvh_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_parent, lbvh_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_left, lbvh_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_right, lbvh_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_flags, lbvh_nodes * sizeof(int)));
+
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&g_vbo_resource, vbo, cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaEventCreate(&g_start_event));
     CUDA_CHECK(cudaEventCreate(&g_stop_event));
@@ -495,6 +776,46 @@ extern "C" void cuda_visualizer_destroy(void) {
         CUDA_CHECK(cudaFree(g_cell_end));
         g_cell_end = NULL;
     }
+    if (g_lbvh_morton != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_morton));
+        g_lbvh_morton = NULL;
+    }
+    if (g_lbvh_indices != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_indices));
+        g_lbvh_indices = NULL;
+    }
+    if (g_lbvh_aabb_min_x != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb_min_x));
+        g_lbvh_aabb_min_x = NULL;
+    }
+    if (g_lbvh_aabb_min_y != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb_min_y));
+        g_lbvh_aabb_min_y = NULL;
+    }
+    if (g_lbvh_aabb_max_x != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb_max_x));
+        g_lbvh_aabb_max_x = NULL;
+    }
+    if (g_lbvh_aabb_max_y != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb_max_y));
+        g_lbvh_aabb_max_y = NULL;
+    }
+    if (g_lbvh_parent != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_parent));
+        g_lbvh_parent = NULL;
+    }
+    if (g_lbvh_left != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_left));
+        g_lbvh_left = NULL;
+    }
+    if (g_lbvh_right != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_right));
+        g_lbvh_right = NULL;
+    }
+    if (g_lbvh_flags != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_flags));
+        g_lbvh_flags = NULL;
+    }
     if (g_start_event != NULL) {
         CUDA_CHECK(cudaEventDestroy(g_start_event));
         g_start_event = NULL;
@@ -523,7 +844,8 @@ extern "C" int cuda_visualizer_reset(int clustered) {
 extern "C" int cuda_visualizer_set_mode(int mode) {
     if (mode != VISUALIZER_MODE_CUDA_BRUTE_FORCE
         && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID
-        && mode != VISUALIZER_MODE_CPU_BRUTE_FORCE) {
+        && mode != VISUALIZER_MODE_CPU_BRUTE_FORCE
+        && mode != VISUALIZER_MODE_CUDA_LBVH) {
         return 0;
     }
     g_mode = mode;
@@ -577,6 +899,8 @@ extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
 
     if (g_mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
         run_uniform_grid(blocks, threads);
+    } else if (g_mode == VISUALIZER_MODE_CUDA_LBVH) {
+        run_lbvh(blocks, threads);
     } else {
         run_brute_force(blocks, threads);
     }
