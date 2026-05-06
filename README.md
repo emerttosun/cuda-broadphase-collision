@@ -95,8 +95,8 @@ If you run the binary from the `build` directory, the output path will be `build
 If CMake is not available or gives issues, build manually from the project root:
 
 ```bash
-nvcc src/main.cu src/CudaBruteForce.cu src/CudaGrid.cu \
-src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
+nvcc src/CudaBruteForce.cu src/CudaGrid.cu \
+src/main.c src/Timer.c src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
 -Iinclude -std=c++17 -o collision_benchmark
 
 ./collision_benchmark
@@ -105,8 +105,8 @@ src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
 If building from inside `build`, use:
 
 ```bash
-nvcc ../src/main.cu ../src/CudaBruteForce.cu ../src/CudaGrid.cu \
-../src/CpuCollision.c ../src/DataGenerator.c ../src/Benchmark.c \
+nvcc ../src/CudaBruteForce.cu ../src/CudaGrid.cu \
+../src/main.c ../src/Timer.c ../src/CpuCollision.c ../src/DataGenerator.c ../src/Benchmark.c \
 -I../include -std=c++17 -o collision_benchmark
 ```
 
@@ -134,8 +134,8 @@ If CMake fails in Colab, use manual `nvcc`:
 
 ```python
 %cd /content/collision-cuda-project
-!nvcc src/main.cu src/CudaBruteForce.cu src/CudaGrid.cu \
-src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
+!nvcc src/CudaBruteForce.cu src/CudaGrid.cu \
+src/main.c src/Timer.c src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
 -Iinclude -std=c++17 -o collision_benchmark
 !./collision_benchmark
 ```
@@ -161,20 +161,17 @@ See [visualization/raylib-cuda-interop/README.md](visualization/raylib-cuda-inte
 - `method_name`
 - `collision_count`
 - `candidate_pair_count`
-- `execution_time_ms`
-- `speedup_vs_cpu`
+- `kernel_time_ms` — pure kernel/loop time. CUDA rows exclude H2D/D2H transfers; CPU row equals total time.
+- `total_time_ms` — wall-clock time including allocations and host-device transfers. CPU row equals kernel time.
+- `speedup_vs_cpu` — `CPU total_time_ms / method total_time_ms`. For CPU rows it is `1.0`.
 - `grid_cell_size`
 - `max_objects_in_cell`
 - `avg_objects_per_non_empty_cell`
 - `dense_cell_count`
 
-`speedup_vs_cpu` is computed as:
-
-```text
-CPU brute force time / method time
-```
-
-For CPU rows it is `1.0`.
+The CPU baseline is timed with `clock_gettime(CLOCK_MONOTONIC)` (or
+`QueryPerformanceCounter` on Windows), so the CPU number is wall-clock time and
+directly comparable to the CUDA `total_time_ms`.
 
 ## Expected Results
 

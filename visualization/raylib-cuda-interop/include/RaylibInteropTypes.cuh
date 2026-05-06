@@ -4,6 +4,11 @@
 extern "C" {
 #endif
 
+typedef enum VisualizerMode {
+    VISUALIZER_MODE_CUDA_BRUTE_FORCE = 0,
+    VISUALIZER_MODE_CUDA_UNIFORM_GRID = 1
+} VisualizerMode;
+
 typedef struct RenderVertex {
     float x;
     float y;
@@ -23,6 +28,7 @@ typedef struct VisualizerMetrics {
 int cuda_visualizer_create(unsigned int vbo, int object_count, int width, int height);
 void cuda_visualizer_destroy(void);
 int cuda_visualizer_reset(int clustered);
+int cuda_visualizer_set_mode(int mode);
 int cuda_visualizer_step(float dt, VisualizerMetrics* metrics);
 
 #ifdef __cplusplus

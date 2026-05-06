@@ -14,7 +14,8 @@ else()
 endif()
 
 add_executable(collision_benchmark
-    src/main.cu
+    src/main.c
+    src/Timer.c
     src/DataGenerator.c
     src/CpuCollision.c
     src/CudaBruteForce.cu

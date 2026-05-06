@@ -1,6 +1,8 @@
 #pragma once
 
+#include "Broadphase.h"
 #include "Circle.h"
+#include "CollisionResult.h"
 
 #include <stddef.h>
 
@@ -8,13 +10,7 @@
 extern "C" {
 #endif
 
-typedef struct CudaCollisionResult {
-    unsigned long long collision_count;
-    unsigned long long candidate_pair_count;
-    double execution_time_ms;
-} CudaCollisionResult;
-
-CudaCollisionResult run_cuda_brute_force(const Circle* circles, size_t count);
+CollisionResult run_cuda_brute_force(const Circle* circles, size_t count, const void* params);
 
 #ifdef __cplusplus
 }

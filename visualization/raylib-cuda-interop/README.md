@@ -96,15 +96,23 @@ cmake --build . --config Release
 
 - `Space`: pause/resume
 - `C`: switch uniform/clustered distribution
+- `G`: toggle CUDA brute force / CUDA uniform grid mode
 - `R`: reset current distribution
 - `Esc`: quit
 
 ## Current Scope
 
-The first Raylib interop version visualizes a live CUDA brute force collision kernel:
+This visualizer supports two live CUDA broad-phase modes that share the same
+collision math (`include/CollisionMath.h`) with the offline benchmark:
+
+- `cuda_brute_force` — every thread compares its ball with all later balls.
+- `cuda_uniform_grid` — balls are bucketed into a uniform grid, sorted by
+  `cell_id` with Thrust, then each ball only checks its 9-cell neighborhood.
+
+Particle rendering uses CUDA-OpenGL interop: CUDA writes triangle vertices
+directly into the rlgl-managed VBO, so particle data is never mirrored on the
+CPU. Colors:
 
 - blue particles are not colliding
 - red particles are colliding
 - metrics are displayed in the top-left overlay
-
-The next planned extension is a CUDA uniform-grid visualization mode with grid overlays and candidate-pair sampling.

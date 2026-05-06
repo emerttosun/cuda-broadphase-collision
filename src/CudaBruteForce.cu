@@ -1,15 +1,11 @@
 #include "CudaBruteForce.cuh"
+#include "CollisionMath.h"
 #include "CudaUtils.cuh"
+#include "Timer.h"
 
 #include <cuda_runtime.h>
 
-__device__ static int device_circles_collide(const Circle& a, const Circle& b) {
-    const float dx = a.x - b.x;
-    const float dy = a.y - b.y;
-    const float radius_sum = a.radius + b.radius;
-    const float distance_squared = dx * dx + dy * dy;
-    return distance_squared <= radius_sum * radius_sum;
-}
+#include <string.h>
 
 __global__ static void cuda_brute_force_kernel(
     const Circle* circles,
@@ -23,10 +19,12 @@ __global__ static void cuda_brute_force_kernel(
 
     unsigned long long local_collisions = 0;
     unsigned long long local_candidates = 0;
+    const Circle a = circles[i];
 
     for (size_t j = i + 1; j < count; ++j) {
         local_candidates++;
-        if (device_circles_collide(circles[i], circles[j])) {
+        const Circle b = circles[j];
+        if (circles_overlap(&a, &b)) {
             local_collisions++;
         }
     }
@@ -39,15 +37,17 @@ __global__ static void cuda_brute_force_kernel(
     }
 }
 
-extern "C" CudaCollisionResult run_cuda_brute_force(const Circle* circles, size_t count) {
-    CudaCollisionResult result;
-    result.collision_count = 0;
-    result.candidate_pair_count = 0;
-    result.execution_time_ms = 0.0;
+extern "C" CollisionResult run_cuda_brute_force(const Circle* circles, size_t count, const void* params) {
+    (void)params;
 
-    if (count == 0) {
+    CollisionResult result;
+    memset(&result, 0, sizeof(result));
+
+    if (circles == NULL || count == 0) {
         return result;
     }
+
+    const double total_start = timer_now_ms();
 
     Circle* d_circles = NULL;
     unsigned long long* d_collision_count = NULL;
@@ -77,11 +77,11 @@ extern "C" CudaCollisionResult run_cuda_brute_force(const Circle* circles, size_
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
-    float elapsed = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+    float kernel_elapsed = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&kernel_elapsed, start, stop));
     CUDA_CHECK(cudaMemcpy(&result.collision_count, d_collision_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&result.candidate_pair_count, d_candidate_pair_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    result.execution_time_ms = (double)elapsed;
+    result.kernel_time_ms = (double)kernel_elapsed;
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -89,5 +89,6 @@ extern "C" CudaCollisionResult run_cuda_brute_force(const Circle* circles, size_
     CUDA_CHECK(cudaFree(d_collision_count));
     CUDA_CHECK(cudaFree(d_candidate_pair_count));
 
+    result.total_time_ms = timer_now_ms() - total_start;
     return result;
 }

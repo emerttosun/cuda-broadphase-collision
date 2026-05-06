@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RaylibCudaInteropVisualizer LANGUAGES CXX CUDA)
+project(RaylibCudaInteropVisualizer LANGUAGES C CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
@@ -22,7 +22,7 @@ else()
 endif()
 
 add_executable(raylib_cuda_visualizer
-    src/main.cpp
+    src/main.c
     src/CudaSimulation.cu
 )
 
@@ -36,4 +36,8 @@ target_link_libraries(raylib_cuda_visualizer PRIVATE raylib)
 set_target_properties(raylib_cuda_visualizer PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES "${CMP674_CUDA_ARCHITECTURES}"
+)
+
+target_compile_options(raylib_cuda_visualizer PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )

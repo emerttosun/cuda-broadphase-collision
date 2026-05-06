@@ -3,9 +3,9 @@
 #include "raylib.h"
 #include "rlgl.h"
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static const int kWindowWidth = 1280;
 static const int kWindowHeight = 720;
@@ -64,10 +64,17 @@ static void draw_particles(unsigned int vao, unsigned int shader_program, int ob
     rlDisableShader();
 }
 
+static const char* mode_name(int mode) {
+    if (mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
+        return "cuda_uniform_grid";
+    }
+    return "cuda_brute_force";
+}
+
 int main(int argc, char** argv) {
     int object_count = 2500;
     if (argc > 1) {
-        object_count = std::atoi(argv[1]);
+        object_count = atoi(argv[1]);
         if (object_count < 100) {
             object_count = 100;
         }
@@ -78,7 +85,7 @@ int main(int argc, char** argv) {
     SetTargetFPS(60);
     unsigned int particle_shader = rlLoadShaderProgram(kVertexShader, kFragmentShader);
     if (particle_shader == 0) {
-        std::fprintf(stderr, "Failed to create particle shader.\n");
+        fprintf(stderr, "Failed to create particle shader.\n");
         return 1;
     }
 
@@ -87,14 +94,15 @@ int main(int argc, char** argv) {
     create_particle_buffers(&vao, &vbo, object_count);
 
     if (!cuda_visualizer_create(vbo, object_count, kWindowWidth, kWindowHeight)) {
-        std::fprintf(stderr, "Failed to create CUDA visualizer.\n");
+        fprintf(stderr, "Failed to create CUDA visualizer.\n");
         return 1;
     }
 
     int clustered = 0;
     int paused = 0;
+    int mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
     VisualizerMetrics metrics;
-    std::memset(&metrics, 0, sizeof(metrics));
+    memset(&metrics, 0, sizeof(metrics));
 
     while (!WindowShouldClose()) {
         if (IsKeyPressed(KEY_SPACE)) {
@@ -107,21 +115,28 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_R)) {
             cuda_visualizer_reset(clustered);
         }
+        if (IsKeyPressed(KEY_G)) {
+            mode = (mode == VISUALIZER_MODE_CUDA_BRUTE_FORCE)
+                       ? VISUALIZER_MODE_CUDA_UNIFORM_GRID
+                       : VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+            cuda_visualizer_set_mode(mode);
+        }
         if (!paused) {
             cuda_visualizer_step(GetFrameTime(), &metrics);
         }
 
         BeginDrawing();
-        ClearBackground(Color{8, 10, 14, 255});
+        ClearBackground((Color){8, 10, 14, 255});
         draw_particles(vao, particle_shader, object_count);
 
-        DrawRectangle(12, 12, 460, 148, Color{18, 22, 30, 220});
+        DrawRectangle(12, 12, 480, 196, (Color){18, 22, 30, 220});
         DrawText("Raylib + CUDA-OpenGL Interop", 24, 24, 20, RAYWHITE);
         DrawText(TextFormat("Objects: %d", object_count), 24, 52, 18, LIGHTGRAY);
         DrawText(TextFormat("Distribution: %s  [C]", clustered ? "clustered" : "uniform"), 24, 76, 18, LIGHTGRAY);
-        DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 100, 18, LIGHTGRAY);
-        DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 124, 18, LIGHTGRAY);
-        DrawText(TextFormat("CUDA frame: %.3f ms | Space pause | R reset", metrics.gpu_time_ms), 24, 148, 18, LIGHTGRAY);
+        DrawText(TextFormat("Method: %s  [G]", mode_name(mode)), 24, 100, 18, LIGHTGRAY);
+        DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 124, 18, LIGHTGRAY);
+        DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 148, 18, LIGHTGRAY);
+        DrawText(TextFormat("CUDA frame: %.3f ms", (double)metrics.gpu_time_ms), 24, 172, 18, LIGHTGRAY);
 
         EndDrawing();
     }

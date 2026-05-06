@@ -1,12 +1,17 @@
 #include "CudaGrid.cuh"
+#include "CollisionMath.h"
 #include "CudaUtils.cuh"
+#include "Timer.h"
 
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 
 #include <cuda_runtime.h>
+
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 __device__ static int clamp_int_device(int value, int min_value, int max_value) {
     if (value < min_value) {
@@ -16,14 +21,6 @@ __device__ static int clamp_int_device(int value, int min_value, int max_value) 
         return max_value;
     }
     return value;
-}
-
-__device__ static int device_grid_collide(const Circle& a, const Circle& b) {
-    const float dx = a.x - b.x;
-    const float dy = a.y - b.y;
-    const float radius_sum = a.radius + b.radius;
-    const float distance_squared = dx * dx + dy * dy;
-    return distance_squared <= radius_sum * radius_sum;
 }
 
 __global__ static void compute_cell_keys_kernel(
@@ -43,6 +40,15 @@ __global__ static void compute_cell_keys_kernel(
     const int cell_y = clamp_int_device((int)floorf(circles[i].y / cell_size), 0, grid_height - 1);
     cell_keys[i] = cell_y * grid_width + cell_x;
     indices[i] = (int)i;
+}
+
+__global__ static void init_cell_ranges_kernel(int* cell_start, int* cell_end, int total_cells) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_cells) {
+        return;
+    }
+    cell_start[i] = -1;
+    cell_end[i] = -1;
 }
 
 __global__ static void build_cell_ranges_kernel(
@@ -111,7 +117,8 @@ __global__ static void grid_collision_kernel(
                 }
 
                 local_candidates++;
-                if (device_grid_collide(object, circles[other_index])) {
+                const Circle other = circles[other_index];
+                if (circles_overlap(&object, &other)) {
                     local_collisions++;
                 }
             }
@@ -167,27 +174,33 @@ static GridStats compute_grid_stats_on_host(
     return stats;
 }
 
-extern "C" CudaGridResult run_cuda_uniform_grid(
-    const Circle* circles,
-    size_t count,
-    float scene_width,
-    float scene_height,
-    float cell_size,
-    int dense_cell_threshold) {
-    CudaGridResult result;
-    result.collision_count = 0;
-    result.candidate_pair_count = 0;
-    result.execution_time_ms = 0.0;
-    result.grid_stats.max_objects_in_cell = 0;
-    result.grid_stats.avg_objects_per_non_empty_cell = 0.0;
-    result.grid_stats.dense_cell_count = 0;
+extern "C" CollisionResult run_cuda_uniform_grid(const Circle* circles, size_t count, const void* params) {
+    CollisionResult result;
+    memset(&result, 0, sizeof(result));
+    result.has_grid_stats = 1;
 
-    if (count == 0 || cell_size <= 0.0f) {
+    if (params == NULL) {
+        fprintf(stderr, "run_cuda_uniform_grid: params must point to CudaGridParams.\n");
         return result;
     }
 
-    const int grid_width = (int)ceilf(scene_width / cell_size);
-    const int grid_height = (int)ceilf(scene_height / cell_size);
+    const CudaGridParams* p = (const CudaGridParams*)params;
+    if (circles == NULL || count == 0 || p->cell_size <= 0.0f) {
+        return result;
+    }
+
+    if (p->max_radius > 0.0f && p->cell_size < 2.0f * p->max_radius) {
+        fprintf(stderr,
+                "run_cuda_uniform_grid: cell_size %.3f < 2 * max_radius %.3f; "
+                "8-neighbor search may miss collisions.\n",
+                (double)p->cell_size,
+                (double)p->max_radius);
+    }
+
+    const double total_start = timer_now_ms();
+
+    const int grid_width = (int)ceilf(p->scene_width / p->cell_size);
+    const int grid_height = (int)ceilf(p->scene_height / p->cell_size);
     const int total_cells = grid_width * grid_height;
 
     Circle* d_circles = NULL;
@@ -210,8 +223,6 @@ extern "C" CudaGridResult run_cuda_uniform_grid(
     CUDA_CHECK(cudaMalloc((void**)&d_collision_count, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void**)&d_candidate_pair_count, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemcpy(d_circles, circles, count * sizeof(Circle), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_cell_start, 0xFF, total_cells * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_cell_end, 0xFF, total_cells * sizeof(int)));
     CUDA_CHECK(cudaMemset(d_collision_count, 0, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(d_candidate_pair_count, 0, sizeof(unsigned long long)));
     CUDA_CHECK(cudaEventCreate(&start));
@@ -219,14 +230,18 @@ extern "C" CudaGridResult run_cuda_uniform_grid(
 
     const int threads_per_block = 256;
     const int blocks = (int)((count + threads_per_block - 1) / threads_per_block);
+    const int cell_blocks = (total_cells + threads_per_block - 1) / threads_per_block;
 
     CUDA_CHECK(cudaEventRecord(start));
+    init_cell_ranges_kernel<<<cell_blocks, threads_per_block>>>(d_cell_start, d_cell_end, total_cells);
+    CUDA_CHECK(cudaGetLastError());
+
     compute_cell_keys_kernel<<<blocks, threads_per_block>>>(
         d_circles,
         d_cell_keys,
         d_indices,
         count,
-        cell_size,
+        p->cell_size,
         grid_width,
         grid_height);
     CUDA_CHECK(cudaGetLastError());
@@ -253,9 +268,9 @@ extern "C" CudaGridResult run_cuda_uniform_grid(
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
-    float elapsed = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
-    result.execution_time_ms = (double)elapsed;
+    float kernel_elapsed = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&kernel_elapsed, start, stop));
+    result.kernel_time_ms = (double)kernel_elapsed;
     CUDA_CHECK(cudaMemcpy(&result.collision_count, d_collision_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&result.candidate_pair_count, d_candidate_pair_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
 
@@ -264,7 +279,7 @@ extern "C" CudaGridResult run_cuda_uniform_grid(
     if (h_cell_start != NULL && h_cell_end != NULL) {
         CUDA_CHECK(cudaMemcpy(h_cell_start, d_cell_start, total_cells * sizeof(int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_cell_end, d_cell_end, total_cells * sizeof(int), cudaMemcpyDeviceToHost));
-        result.grid_stats = compute_grid_stats_on_host(h_cell_start, h_cell_end, total_cells, dense_cell_threshold);
+        result.grid_stats = compute_grid_stats_on_host(h_cell_start, h_cell_end, total_cells, p->dense_cell_threshold);
     }
 
     free(h_cell_start);
@@ -279,5 +294,6 @@ extern "C" CudaGridResult run_cuda_uniform_grid(
     CUDA_CHECK(cudaFree(d_collision_count));
     CUDA_CHECK(cudaFree(d_candidate_pair_count));
 
+    result.total_time_ms = timer_now_ms() - total_start;
     return result;
 }

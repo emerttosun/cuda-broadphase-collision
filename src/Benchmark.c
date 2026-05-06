@@ -1,4 +1,5 @@
 #include "Benchmark.h"
+#include "Broadphase.h"
 #include "CpuCollision.h"
 #include "CudaBruteForce.cuh"
 #include "CudaGrid.cuh"
@@ -13,6 +14,8 @@
 #ifdef _WIN32
 #include <direct.h>
 #endif
+
+#define MAX_METHODS_PER_DISTRIBUTION (2 + MAX_GRID_CELL_SIZES)
 
 static int ensure_results_directory(void) {
 #ifdef _WIN32
@@ -31,32 +34,74 @@ static void write_csv_header(FILE* file) {
     fprintf(
         file,
         "object_count,distribution_type,method_name,collision_count,"
-        "candidate_pair_count,execution_time_ms,speedup_vs_cpu,grid_cell_size,"
+        "candidate_pair_count,kernel_time_ms,total_time_ms,speedup_vs_cpu,grid_cell_size,"
         "max_objects_in_cell,avg_objects_per_non_empty_cell,dense_cell_count\n");
 }
 
-static void write_csv_result(FILE* file, const BenchmarkResult* result) {
+static void write_csv_result(FILE* file, const BenchmarkResult* row) {
     fprintf(
         file,
-        "%zu,%s,%s,%llu,%llu,%.6f,%.6f,%.2f,%d,%.6f,%d\n",
-        result->object_count,
-        result->distribution_type,
-        result->method_name,
-        result->collision_count,
-        result->candidate_pair_count,
-        result->execution_time_ms,
-        result->speedup_vs_cpu,
-        result->grid_cell_size,
-        result->grid_stats.max_objects_in_cell,
-        result->grid_stats.avg_objects_per_non_empty_cell,
-        result->grid_stats.dense_cell_count);
+        "%zu,%s,%s,%llu,%llu,%.6f,%.6f,%.6f,%.2f,%d,%.6f,%d\n",
+        row->object_count,
+        row->distribution_type,
+        row->method_name,
+        row->collision_count,
+        row->candidate_pair_count,
+        row->kernel_time_ms,
+        row->total_time_ms,
+        row->speedup_vs_cpu,
+        row->grid_cell_size,
+        row->has_grid_stats ? row->grid_stats.max_objects_in_cell : 0,
+        row->has_grid_stats ? row->grid_stats.avg_objects_per_non_empty_cell : 0.0,
+        row->has_grid_stats ? row->grid_stats.dense_cell_count : 0);
 }
 
-static double speedup_from_cpu(double cpu_ms, double method_ms) {
-    if (method_ms <= 0.0) {
+static double speedup_from_cpu(double cpu_total_ms, double method_total_ms) {
+    if (method_total_ms <= 0.0) {
         return 0.0;
     }
-    return cpu_ms / method_ms;
+    return cpu_total_ms / method_total_ms;
+}
+
+static int build_methods(
+    const BenchmarkConfig* config,
+    BroadphaseMethod* methods,
+    CudaGridParams* grid_params_storage,
+    int max_methods) {
+    int n = 0;
+    if (n >= max_methods) {
+        return n;
+    }
+    methods[n].name = "cpu_brute_force";
+    methods[n].run = run_cpu_brute_force;
+    methods[n].params = NULL;
+    methods[n].reported_grid_cell_size = 0.0f;
+    n++;
+
+    if (n >= max_methods) {
+        return n;
+    }
+    methods[n].name = "cuda_brute_force";
+    methods[n].run = run_cuda_brute_force;
+    methods[n].params = NULL;
+    methods[n].reported_grid_cell_size = 0.0f;
+    n++;
+
+    for (int i = 0; i < config->grid_cell_size_len && n < max_methods; ++i) {
+        grid_params_storage[i].scene_width = config->scene_width;
+        grid_params_storage[i].scene_height = config->scene_height;
+        grid_params_storage[i].cell_size = config->grid_cell_sizes[i];
+        grid_params_storage[i].max_radius = config->max_radius;
+        grid_params_storage[i].dense_cell_threshold = config->dense_cell_threshold;
+
+        methods[n].name = "cuda_uniform_grid";
+        methods[n].run = run_cuda_uniform_grid;
+        methods[n].params = &grid_params_storage[i];
+        methods[n].reported_grid_cell_size = config->grid_cell_sizes[i];
+        n++;
+    }
+
+    return n;
 }
 
 static int run_distribution(
@@ -64,76 +109,70 @@ static int run_distribution(
     const BenchmarkConfig* config,
     size_t object_count,
     const char* distribution_name,
-    Circle* circles) {
-    if (circles == NULL) {
-        fprintf(stderr, "Failed to allocate circles for %zu objects (%s).\n", object_count, distribution_name);
+    const Circle* circles,
+    const BroadphaseMethod* methods,
+    int method_count) {
+    if (circles == NULL || methods == NULL || method_count <= 0) {
         return 0;
     }
 
     printf("Running %zu objects, %s distribution...\n", object_count, distribution_name);
 
-    CpuCollisionResult cpu = run_cpu_brute_force(circles, object_count);
-    BenchmarkResult row;
-    memset(&row, 0, sizeof(row));
-    row.object_count = object_count;
-    row.distribution_type = distribution_name;
-    row.method_name = "cpu_brute_force";
-    row.collision_count = cpu.collision_count;
-    row.candidate_pair_count = cpu.candidate_pair_count;
-    row.execution_time_ms = cpu.execution_time_ms;
-    row.speedup_vs_cpu = 1.0;
-    write_csv_result(csv, &row);
-    printf("  CPU brute force: collisions=%llu time=%.3f ms\n", cpu.collision_count, cpu.execution_time_ms);
+    double cpu_total_ms = 0.0;
+    int cpu_seen = 0;
 
-    CudaCollisionResult cuda_brute = run_cuda_brute_force(circles, object_count);
-    memset(&row, 0, sizeof(row));
-    row.object_count = object_count;
-    row.distribution_type = distribution_name;
-    row.method_name = "cuda_brute_force";
-    row.collision_count = cuda_brute.collision_count;
-    row.candidate_pair_count = cuda_brute.candidate_pair_count;
-    row.execution_time_ms = cuda_brute.execution_time_ms;
-    row.speedup_vs_cpu = speedup_from_cpu(cpu.execution_time_ms, cuda_brute.execution_time_ms);
-    write_csv_result(csv, &row);
-    printf("  CUDA brute force: collisions=%llu time=%.3f ms speedup=%.2fx\n",
-           cuda_brute.collision_count,
-           cuda_brute.execution_time_ms,
-           row.speedup_vs_cpu);
+    for (int m = 0; m < method_count; ++m) {
+        const CollisionResult res = methods[m].run(circles, object_count, methods[m].params);
 
-    for (int i = 0; i < config->grid_cell_size_len; ++i) {
-        const float cell_size = config->grid_cell_sizes[i];
-        CudaGridResult grid = run_cuda_uniform_grid(
-            circles,
-            object_count,
-            config->scene_width,
-            config->scene_height,
-            cell_size,
-            config->dense_cell_threshold);
-
+        BenchmarkResult row;
         memset(&row, 0, sizeof(row));
         row.object_count = object_count;
         row.distribution_type = distribution_name;
-        row.method_name = "cuda_uniform_grid";
-        row.collision_count = grid.collision_count;
-        row.candidate_pair_count = grid.candidate_pair_count;
-        row.execution_time_ms = grid.execution_time_ms;
-        row.speedup_vs_cpu = speedup_from_cpu(cpu.execution_time_ms, grid.execution_time_ms);
-        row.grid_cell_size = cell_size;
-        row.grid_stats = grid.grid_stats;
+        row.method_name = methods[m].name;
+        row.collision_count = res.collision_count;
+        row.candidate_pair_count = res.candidate_pair_count;
+        row.kernel_time_ms = res.kernel_time_ms;
+        row.total_time_ms = res.total_time_ms;
+        row.grid_cell_size = methods[m].reported_grid_cell_size;
+        row.has_grid_stats = res.has_grid_stats;
+        row.grid_stats = res.grid_stats;
+
+        if (!cpu_seen && strcmp(methods[m].name, "cpu_brute_force") == 0) {
+            cpu_total_ms = res.total_time_ms;
+            cpu_seen = 1;
+            row.speedup_vs_cpu = 1.0;
+        } else if (cpu_seen) {
+            row.speedup_vs_cpu = speedup_from_cpu(cpu_total_ms, res.total_time_ms);
+        } else {
+            row.speedup_vs_cpu = 0.0;
+        }
+
         write_csv_result(csv, &row);
 
-        printf("  CUDA grid cell=%.2f: collisions=%llu candidates=%llu time=%.3f ms speedup=%.2fx max_cell=%d dense=%d\n",
-               cell_size,
-               grid.collision_count,
-               grid.candidate_pair_count,
-               grid.execution_time_ms,
-               row.speedup_vs_cpu,
-               grid.grid_stats.max_objects_in_cell,
-               grid.grid_stats.dense_cell_count);
+        if (row.has_grid_stats) {
+            printf("  %-18s cell=%.2f: collisions=%llu candidates=%llu kernel=%.3f ms total=%.3f ms speedup=%.2fx max_cell=%d dense=%d\n",
+                   row.method_name,
+                   row.grid_cell_size,
+                   row.collision_count,
+                   row.candidate_pair_count,
+                   row.kernel_time_ms,
+                   row.total_time_ms,
+                   row.speedup_vs_cpu,
+                   row.grid_stats.max_objects_in_cell,
+                   row.grid_stats.dense_cell_count);
+        } else {
+            printf("  %-18s          : collisions=%llu candidates=%llu kernel=%.3f ms total=%.3f ms speedup=%.2fx\n",
+                   row.method_name,
+                   row.collision_count,
+                   row.candidate_pair_count,
+                   row.kernel_time_ms,
+                   row.total_time_ms,
+                   row.speedup_vs_cpu);
+        }
     }
 
-    free(circles);
     fflush(csv);
+    (void)config;
     return 1;
 }
 
@@ -184,20 +223,38 @@ int run_benchmarks(const BenchmarkConfig* config) {
 
     write_csv_header(csv);
 
+    BroadphaseMethod methods[MAX_METHODS_PER_DISTRIBUTION];
+    CudaGridParams grid_params_storage[MAX_GRID_CELL_SIZES];
+    const int method_count = build_methods(config, methods, grid_params_storage, MAX_METHODS_PER_DISTRIBUTION);
+
     for (int i = 0; i < config->object_count_len; ++i) {
         const size_t object_count = config->object_counts[i];
 
         Circle* uniform = generate_uniform_circles(object_count, config);
-        if (!run_distribution(csv, config, object_count, "uniform", uniform)) {
+        if (uniform == NULL) {
+            fprintf(stderr, "Failed to allocate uniform circles for %zu objects.\n", object_count);
             fclose(csv);
             return 0;
         }
+        if (!run_distribution(csv, config, object_count, "uniform", uniform, methods, method_count)) {
+            free(uniform);
+            fclose(csv);
+            return 0;
+        }
+        free(uniform);
 
         Circle* clustered = generate_clustered_circles(object_count, config);
-        if (!run_distribution(csv, config, object_count, "clustered", clustered)) {
+        if (clustered == NULL) {
+            fprintf(stderr, "Failed to allocate clustered circles for %zu objects.\n", object_count);
             fclose(csv);
             return 0;
         }
+        if (!run_distribution(csv, config, object_count, "clustered", clustered, methods, method_count)) {
+            free(clustered);
+            fclose(csv);
+            return 0;
+        }
+        free(clustered);
     }
 
     fclose(csv);

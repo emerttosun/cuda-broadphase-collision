@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GridStats.h"
+
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -8,12 +10,6 @@ extern "C" {
 
 #define MAX_BENCHMARK_OBJECT_COUNTS 5
 #define MAX_GRID_CELL_SIZES 4
-
-typedef struct GridStats {
-    int max_objects_in_cell;
-    double avg_objects_per_non_empty_cell;
-    int dense_cell_count;
-} GridStats;
 
 typedef struct BenchmarkConfig {
     size_t object_counts[MAX_BENCHMARK_OBJECT_COUNTS];
@@ -37,9 +33,11 @@ typedef struct BenchmarkResult {
     const char* method_name;
     unsigned long long collision_count;
     unsigned long long candidate_pair_count;
-    double execution_time_ms;
+    double kernel_time_ms;
+    double total_time_ms;
     double speedup_vs_cpu;
     float grid_cell_size;
+    int has_grid_stats;
     GridStats grid_stats;
 } BenchmarkResult;
 
