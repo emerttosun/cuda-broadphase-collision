@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include "ICollisionDetector.h"
 
 class CudaGridDetector : public ICollisionDetector {

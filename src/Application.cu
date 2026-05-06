@@ -11,7 +11,28 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+#ifndef NOUSER
+#define NOUSER
+#endif
 #include <windows.h>
+#ifdef PlaySound
+#undef PlaySound
+#endif
+#ifdef DrawText
+#undef DrawText
+#endif
+#ifdef ShowCursor
+#undef ShowCursor
+#endif
+#ifdef CloseWindow
+#undef CloseWindow
+#endif
+#ifdef Rectangle
+#undef Rectangle
+#endif
 #include <GL/gl.h>
 #endif
 
