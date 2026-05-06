@@ -1,0 +1,73 @@
+Output CSV: results/timings.csv
+Note: run this binary on a CUDA-capable NVIDIA GPU system.
+
+Running 1000 objects, uniform distribution...
+  CPU brute force: collisions=19 time=4.932 ms
+  CUDA brute force: collisions=19 time=1.053 ms speedup=4.69x
+  CUDA grid cell=5.00: collisions=19 candidates=122 time=0.864 ms speedup=5.71x max_cell=2 dense=0
+  CUDA grid cell=10.00: collisions=19 candidates=438 time=0.089 ms speedup=55.42x max_cell=3 dense=0
+  CUDA grid cell=20.00: collisions=19 candidates=1741 time=0.089 ms speedup=55.16x max_cell=4 dense=0
+  CUDA grid cell=40.00: collisions=19 candidates=6846 time=0.105 ms speedup=47.12x max_cell=6 dense=0
+Running 1000 objects, clustered distribution...
+  CPU brute force: collisions=2916 time=3.814 ms
+  CUDA brute force: collisions=2916 time=0.090 ms speedup=42.28x
+  CUDA grid cell=5.00: collisions=2916 candidates=17818 time=0.102 ms speedup=37.25x max_cell=39 dense=0
+  CUDA grid cell=10.00: collisions=2916 candidates=58477 time=0.117 ms speedup=32.66x max_cell=79 dense=0
+  CUDA grid cell=20.00: collisions=2916 candidates=178313 time=0.140 ms speedup=27.20x max_cell=145 dense=1
+  CUDA grid cell=40.00: collisions=2916 candidates=404012 time=0.193 ms speedup=19.78x max_cell=311 dense=2
+Running 5000 objects, uniform distribution...
+  CPU brute force: collisions=363 time=96.345 ms
+  CUDA brute force: collisions=363 time=0.518 ms speedup=185.94x
+  CUDA grid cell=5.00: collisions=363 candidates=2827 time=0.535 ms speedup=180.24x max_cell=3 dense=0
+  CUDA grid cell=10.00: collisions=363 candidates=11164 time=0.214 ms speedup=450.58x max_cell=4 dense=0
+  CUDA grid cell=20.00: collisions=363 candidates=43547 time=0.223 ms speedup=431.59x max_cell=7 dense=0
+  CUDA grid cell=40.00: collisions=363 candidates=170941 time=0.227 ms speedup=424.89x max_cell=19 dense=0
+Running 5000 objects, clustered distribution...
+  CPU brute force: collisions=70966 time=95.601 ms
+  CUDA brute force: collisions=70966 time=0.521 ms speedup=183.52x
+  CUDA grid cell=5.00: collisions=70966 candidates=449658 time=0.295 ms speedup=324.20x max_cell=151 dense=2
+  CUDA grid cell=10.00: collisions=70966 candidates=1478261 time=0.369 ms speedup=259.33x max_cell=411 dense=4
+  CUDA grid cell=20.00: collisions=70966 candidates=4398201 time=0.551 ms speedup=173.45x max_cell=732 dense=16
+  CUDA grid cell=40.00: collisions=70966 candidates=10091738 time=0.893 ms speedup=107.02x max_cell=1569 dense=8
+Running 10000 objects, uniform distribution...
+  CPU brute force: collisions=1420 time=379.049 ms
+  CUDA brute force: collisions=1420 time=1.057 ms speedup=358.57x
+  CUDA grid cell=5.00: collisions=1420 candidates=11200 time=0.247 ms speedup=1531.78x max_cell=5 dense=0
+  CUDA grid cell=10.00: collisions=1420 candidates=44525 time=0.230 ms speedup=1649.53x max_cell=6 dense=0
+  CUDA grid cell=20.00: collisions=1420 candidates=175397 time=0.227 ms speedup=1672.35x max_cell=14 dense=0
+  CUDA grid cell=40.00: collisions=1420 candidates=682049 time=0.238 ms speedup=1595.54x max_cell=33 dense=0
+Running 10000 objects, clustered distribution...
+  CPU brute force: collisions=330489 time=395.507 ms
+  CUDA brute force: collisions=330489 time=1.053 ms speedup=375.66x
+  CUDA grid cell=5.00: collisions=330489 candidates=1935349 time=0.416 ms speedup=950.74x max_cell=432 dense=4
+  CUDA grid cell=10.00: collisions=330489 candidates=6050899 time=0.653 ms speedup=605.95x max_cell=850 dense=13
+  CUDA grid cell=20.00: collisions=330489 candidates=17887135 time=1.012 ms speedup=390.93x max_cell=1460 dense=27
+  CUDA grid cell=40.00: collisions=330489 candidates=39927209 time=1.665 ms speedup=237.57x max_cell=2779 dense=10
+Running 50000 objects, uniform distribution...
+  CPU brute force: collisions=35781 time=10257.457 ms
+  CUDA brute force: collisions=35781 time=21.892 ms speedup=468.56x
+  CUDA grid cell=5.00: collisions=35781 candidates=279016 time=0.441 ms speedup=23270.09x max_cell=8 dense=0
+  CUDA grid cell=10.00: collisions=35781 candidates=1110045 time=0.455 ms speedup=22540.30x max_cell=17 dense=0
+  CUDA grid cell=20.00: collisions=35781 candidates=4372998 time=0.508 ms speedup=20190.57x max_cell=38 dense=0
+  CUDA grid cell=40.00: collisions=35781 candidates=17041804 time=0.846 ms speedup=12129.93x max_cell=106 dense=0
+Running 50000 objects, clustered distribution...
+  CPU brute force: collisions=7579570 time=10079.709 ms
+  CUDA brute force: collisions=7579570 time=21.890 ms speedup=460.47x
+  CUDA grid cell=5.00: collisions=7579570 candidates=46252968 time=2.814 ms speedup=3582.05x max_cell=1798 dense=93
+  CUDA grid cell=10.00: collisions=7579570 candidates=150149349 time=6.709 ms speedup=1502.34x max_cell=4526 dense=109
+  CUDA grid cell=20.00: collisions=7579570 candidates=447355766 time=13.069 ms speedup=771.26x max_cell=8452 dense=35
+  CUDA grid cell=40.00: collisions=7579570 candidates=999860000 time=30.617 ms speedup=329.22x max_cell=15633 dense=14
+Running 100000 objects, uniform distribution...
+  CPU brute force: collisions=143249 time=40947.412 ms
+  CUDA brute force: collisions=143249 time=69.908 ms speedup=585.73x
+  CUDA grid cell=5.00: collisions=143249 candidates=1117022 time=0.614 ms speedup=66642.71x max_cell=12 dense=0
+  CUDA grid cell=10.00: collisions=143249 candidates=4437462 time=0.763 ms speedup=53654.52x max_cell=26 dense=0
+  CUDA grid cell=20.00: collisions=143249 candidates=17512411 time=1.005 ms speedup=40732.34x max_cell=65 dense=0
+  CUDA grid cell=40.00: collisions=143249 candidates=68142359 time=2.325 ms speedup=17613.55x max_cell=207 dense=622
+Running 100000 objects, clustered distribution...
+  CPU brute force: collisions=30886392 time=41253.180 ms
+  CUDA brute force: collisions=30886392 time=69.915 ms speedup=590.05x
+  CUDA grid cell=5.00: collisions=30886392 candidates=188645449 time=6.949 ms speedup=5936.95x max_cell=4228 dense=332
+  CUDA grid cell=10.00: collisions=30886392 candidates=608343166 time=18.182 ms speedup=2268.92x max_cell=8234 dense=121
+  CUDA grid cell=20.00: collisions=30886392 candidates=1799925900 time=48.867 ms speedup=844.20x max_cell=14758 dense=36
+  CUDA grid cell=40.00: collisions=30886392 candidates=4070055175 time=107.176 ms speedup=384.91x max_cell=33336 dense=12

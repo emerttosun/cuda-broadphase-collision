@@ -1,1 +1,0 @@
-object_count,distribution_type,method_name,collision_count,candidate_pair_count,execution_time_ms,speedup_vs_cpu,grid_cell_size,max_objects_in_cell,avg_objects_per_non_empty_cell,dense_cell_count
