@@ -70,26 +70,43 @@ vcpkg install raylib:x64-windows
 
 ## Build
 
+The visualizer can be built from the project root (preferred) or
+standalone from this directory.
+
+### From the project root (preferred)
+
 ```powershell
-cd visualization/raylib-cuda-interop
-mkdir build
-cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build . --config Release
-.\Release\raylib_cuda_visualizer.exe 2500
+cd <repo root>
+cmake -B build -DBUILD_VISUALIZER=ON ^
+    -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+.\build\visualization\raylib-cuda-interop\Release\raylib_cuda_visualizer.exe 2500
 ```
 
-If vcpkg is not available, raylib can also be built from source next to this
-repository:
+This produces both the offline benchmark and the visualizer. They link
+against the same `cmp674_core` static library, so they share the same
+collision math and CUDA configuration.
+
+### Standalone
+
+For backwards compatibility the visualizer's CMakeLists.txt also works
+when invoked directly. In this mode it pulls in the parent project to
+build `cmp674_core`.
+
+```powershell
+cd visualization/raylib-cuda-interop
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+.\build\Release\raylib_cuda_visualizer.exe 2500
+```
+
+If vcpkg is not available, raylib can also be built from source next to
+this repository:
 
 ```powershell
 git clone --depth 1 https://github.com/raysan5/raylib.git C:/path/to/raylib
-cd visualization/raylib-cuda-interop
-mkdir build
-cd build
-cmake .. -DRAYLIB_SOURCE_DIR=C:/path/to/raylib
-cmake --build . --config Release
-.\Release\raylib_cuda_visualizer.exe 2500
+cmake -B build -DBUILD_VISUALIZER=ON -DRAYLIB_SOURCE_DIR=C:/path/to/raylib
+cmake --build build --config Release
 ```
 
 ## Controls

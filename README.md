@@ -21,6 +21,8 @@ distanceSquared = dx * dx + dy * dy;
 collision = distanceSquared <= (r1 + r2) * (r1 + r2);
 ```
 
+The check itself lives in `include/CollisionMath.h` as a `__device__ __host__ inline` function, so the CPU baseline, the CUDA brute force kernel, the CUDA uniform-grid kernel and the live visualizer all use exactly the same formula.
+
 ## Broad Phase
 
 Broad phase collision detection reduces the number of object pairs that need detailed testing. Instead of comparing every pair in the scene, a spatial structure first produces a smaller set of candidate pairs. This project uses a uniform grid broad phase.
@@ -66,6 +68,32 @@ For clustered analysis, the grid reports:
 
 The default dense cell threshold is `128`. Dense cell optimization is not implemented in this first version; only the metrics are reported.
 
+## Project Layout
+
+```
+include/                       # Public headers (data types + algorithms)
+src/                           # Shared core implementation + benchmark binary
+visualization/raylib-cuda-interop/   # Optional live visualizer (raylib + CUDA)
+```
+
+The build is driven by a single root `CMakeLists.txt` that produces:
+
+- `cmp674_core` — a CUDA-aware static library that contains every shared
+  algorithm and helper (`Timer`, `DataGenerator`, `CpuCollision`,
+  `CudaBruteForce`, `CudaGrid`). Its public include directory is `include/`,
+  so any target that links against `cmp674_core` automatically sees the
+  shared headers.
+- `collision_benchmark` — the CSV benchmark binary. It only contains
+  `src/main.c` and `src/Benchmark.c` (the orchestration that drives the
+  `BroadphaseMethod` table) and links against `cmp674_core`.
+- `raylib_cuda_visualizer` — the optional live demo. Built only when
+  `-DBUILD_VISUALIZER=ON` is passed. Links against `cmp674_core` and
+  `raylib`.
+
+This means the include path, CUDA architecture list, separable-compilation
+setting and `--expt-relaxed-constexpr` flag are configured exactly once on
+`cmp674_core` and inherited by every consumer.
+
 ## macOS Note
 
 macOS is used only for writing code, Git management, README editing, and report preparation. CUDA compilation and benchmark execution are not expected to run on macOS. Run the benchmark on Linux, Windows, WSL2, or Google Colab with an NVIDIA GPU.
@@ -75,82 +103,79 @@ macOS is used only for writing code, Git management, README editing, and report 
 On a CUDA-capable machine:
 
 ```bash
-mkdir build
-cd build
-cmake ..
-cmake --build .
-./collision_benchmark
+cmake -B build
+cmake --build build -j
+./build/collision_benchmark
 ```
 
-The CSV output is written to:
+The CSV output is written to `results/timings.csv` relative to the working
+directory you run the binary from (so the example above writes
+`build/results/timings.csv`).
 
-```text
-results/timings.csv
-```
+### Build options
 
-If you run the binary from the `build` directory, the output path will be `build/results/timings.csv`.
+| Option | Default | Effect |
+| --- | --- | --- |
+| `BUILD_VISUALIZER` | `OFF` | Also build `raylib_cuda_visualizer`. Requires raylib and an interactive OpenGL/CUDA context. |
+| `CMP674_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) or `60;61;70;75;80;86;89` | Which compute capabilities to generate code for. |
 
-## Manual nvcc Build
-
-If CMake is not available or gives issues, build manually from the project root:
+### Benchmark + visualizer in one configure
 
 ```bash
-nvcc src/CudaBruteForce.cu src/CudaGrid.cu \
-src/main.c src/Timer.c src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
--Iinclude -std=c++17 -o collision_benchmark
-
-./collision_benchmark
+cmake -B build -DBUILD_VISUALIZER=ON \
+    -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build -j
 ```
 
-If building from inside `build`, use:
+This produces both `build/collision_benchmark` and
+`build/visualization/raylib-cuda-interop/raylib_cuda_visualizer`. The
+visualizer reuses the same `cmp674_core` build artifacts as the benchmark, so
+nothing is recompiled twice.
+
+### Visualizer-only build
+
+The visualizer's CMakeLists also works standalone for backwards
+compatibility:
 
 ```bash
-nvcc ../src/CudaBruteForce.cu ../src/CudaGrid.cu \
-../src/main.c ../src/Timer.c ../src/CpuCollision.c ../src/DataGenerator.c ../src/Benchmark.c \
--I../include -std=c++17 -o collision_benchmark
+cd visualization/raylib-cuda-interop
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build
 ```
+
+In standalone mode the visualizer pulls in the parent project just to build
+`cmp674_core`; you still get the same shared library underneath.
 
 ## Google Colab
 
 ```python
 !nvidia-smi
 !nvcc --version
-!git clone git@github.com:emerttosun/CMP674.git collision-cuda-project
+!git clone https://github.com/emerttosun/cuda-broadphase-collision.git collision-cuda-project
 %cd collision-cuda-project
-!mkdir -p build
-%cd build
-!cmake ..
-!make -j2
-!./collision_benchmark
+!cmake -B build
+!cmake --build build -j2
+!./build/collision_benchmark
 ```
 
-If SSH clone is not configured in Colab, use the HTTPS URL instead:
-
-```python
-!git clone https://github.com/emerttosun/CMP674.git collision-cuda-project
-```
-
-If CMake fails in Colab, use manual `nvcc`:
-
-```python
-%cd /content/collision-cuda-project
-!nvcc src/CudaBruteForce.cu src/CudaGrid.cu \
-src/main.c src/Timer.c src/CpuCollision.c src/DataGenerator.c src/Benchmark.c \
--Iinclude -std=c++17 -o collision_benchmark
-!./collision_benchmark
-```
+If you want the live visualizer in Colab, add `-DBUILD_VISUALIZER=ON` and
+make sure raylib is installed; raylib needs an X server, so Colab is not the
+typical environment for it.
 
 ## Live Raylib CUDA Visualization
 
-The core benchmark writes CSV results. A separate live visualizer is available under:
+The core benchmark writes CSV results. The optional live visualizer lives at:
 
 ```text
 visualization/raylib-cuda-interop
 ```
 
-This target uses raylib for the window and UI overlay, while CUDA maps an OpenGL VBO and writes particle positions/colors directly into it through CUDA-OpenGL interop. It is intended for a Windows machine with an NVIDIA GPU.
+It uses raylib for the window and UI overlay while CUDA maps an OpenGL VBO
+and writes particle vertices directly into it through CUDA-OpenGL interop.
+It links against the same `cmp674_core` library as the benchmark, so the
+collision math is shared.
 
-See [visualization/raylib-cuda-interop/README.md](visualization/raylib-cuda-interop/README.md) for build instructions.
+See [visualization/raylib-cuda-interop/README.md](visualization/raylib-cuda-interop/README.md) for build instructions, raylib install steps and the in-app keyboard controls.
 
 ## CSV Columns
 
@@ -179,4 +204,4 @@ CUDA brute force should usually be faster than CPU brute force for larger object
 
 Small collision count differences can happen if floating point behavior differs across CPU and GPU hardware. The benchmark uses the same circle formula for all methods, so results should normally be very close.
 
-The default maximum radius is `2.0`, and the smallest tested grid cell size is `5.0`. This keeps the 8-neighbor grid search valid for the default configuration because the maximum collision distance is smaller than the smallest cell size.
+The default maximum radius is `2.0`, and the smallest tested grid cell size is `5.0`. This keeps the 8-neighbor grid search valid for the default configuration because the maximum collision distance is smaller than the smallest cell size. If `cell_size < 2 * max_radius`, `run_cuda_uniform_grid` prints a warning to `stderr` because the 9-cell neighborhood may then miss collisions.
