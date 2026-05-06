@@ -7,6 +7,14 @@
 #include <raylib.h>
 #include <rlgl.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <GL/gl.h>
+#endif
+
 #include <cuda_gl_interop.h>
 #include <cuda_runtime.h>
 #include <iostream>
