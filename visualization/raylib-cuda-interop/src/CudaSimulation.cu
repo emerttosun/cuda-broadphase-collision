@@ -3,6 +3,7 @@
 #include "CollisionMath.h"
 #include "CudaUtils.cuh"
 #include "Rng.h"
+#include "Timer.h"
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -36,6 +37,7 @@ typedef struct DeviceBall {
 #define VISUALIZER_INIT_SEED 202405u
 
 static DeviceBall* g_balls = NULL;
+static DeviceBall* g_host_balls = NULL;
 static unsigned long long* g_collision_count = NULL;
 static unsigned long long* g_candidate_pair_count = NULL;
 static int* g_cell_keys = NULL;
@@ -333,6 +335,58 @@ static void host_init_balls(DeviceBall* h_balls, int count, int clustered, unsig
     }
 }
 
+static void cpu_integrate(DeviceBall* balls, int count, float dt, int width, int height) {
+    for (int i = 0; i < count; ++i) {
+        DeviceBall* b = &balls[i];
+        b->x += b->vx * dt;
+        b->y += b->vy * dt;
+        if (b->x < b->radius) {
+            b->x = b->radius;
+            b->vx = fabsf(b->vx);
+        } else if (b->x > (float)width - b->radius) {
+            b->x = (float)width - b->radius;
+            b->vx = -fabsf(b->vx);
+        }
+        if (b->y < b->radius) {
+            b->y = b->radius;
+            b->vy = fabsf(b->vy);
+        } else if (b->y > (float)height - b->radius) {
+            b->y = (float)height - b->radius;
+            b->vy = -fabsf(b->vy);
+        }
+        b->colliding = 0;
+    }
+}
+
+static void cpu_brute_force_collide(
+    DeviceBall* balls,
+    int count,
+    unsigned long long* out_collisions,
+    unsigned long long* out_candidates) {
+    unsigned long long collisions = 0;
+    unsigned long long candidates = 0;
+    for (int i = 0; i < count; ++i) {
+        Circle a;
+        a.x = balls[i].x;
+        a.y = balls[i].y;
+        a.radius = balls[i].radius;
+        for (int j = i + 1; j < count; ++j) {
+            Circle b;
+            b.x = balls[j].x;
+            b.y = balls[j].y;
+            b.radius = balls[j].radius;
+            ++candidates;
+            if (circles_overlap(&a, &b)) {
+                balls[i].colliding = 1;
+                balls[j].colliding = 1;
+                ++collisions;
+            }
+        }
+    }
+    *out_collisions = collisions;
+    *out_candidates = candidates;
+}
+
 static void run_brute_force(int blocks, int threads) {
     brute_force_collision_kernel<<<blocks, threads>>>(
         g_balls,
@@ -387,6 +441,10 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     g_total_cells = g_grid_width * g_grid_height;
 
     CUDA_CHECK(cudaMalloc((void**)&g_balls, (size_t)object_count * sizeof(DeviceBall)));
+    g_host_balls = (DeviceBall*)malloc((size_t)object_count * sizeof(DeviceBall));
+    if (g_host_balls == NULL) {
+        return 0;
+    }
     CUDA_CHECK(cudaMalloc((void**)&g_collision_count, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void**)&g_candidate_pair_count, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void**)&g_cell_keys, (size_t)object_count * sizeof(int)));
@@ -408,6 +466,10 @@ extern "C" void cuda_visualizer_destroy(void) {
     if (g_balls != NULL) {
         CUDA_CHECK(cudaFree(g_balls));
         g_balls = NULL;
+    }
+    if (g_host_balls != NULL) {
+        free(g_host_balls);
+        g_host_balls = NULL;
     }
     if (g_collision_count != NULL) {
         CUDA_CHECK(cudaFree(g_collision_count));
@@ -459,7 +521,9 @@ extern "C" int cuda_visualizer_reset(int clustered) {
 }
 
 extern "C" int cuda_visualizer_set_mode(int mode) {
-    if (mode != VISUALIZER_MODE_CUDA_BRUTE_FORCE && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
+    if (mode != VISUALIZER_MODE_CUDA_BRUTE_FORCE
+        && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID
+        && mode != VISUALIZER_MODE_CPU_BRUTE_FORCE) {
         return 0;
     }
     g_mode = mode;
@@ -475,6 +539,34 @@ extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
     const int blocks = (g_object_count + threads - 1) / threads;
     RenderVertex* vertices = NULL;
     size_t mapped_size = 0;
+
+    if (g_mode == VISUALIZER_MODE_CPU_BRUTE_FORCE) {
+        CUDA_CHECK(cudaMemcpy(g_host_balls, g_balls,
+                              (size_t)g_object_count * sizeof(DeviceBall),
+                              cudaMemcpyDeviceToHost));
+
+        const double t0 = timer_now_ms();
+        cpu_integrate(g_host_balls, g_object_count, dt, g_width, g_height);
+        unsigned long long h_collisions = 0;
+        unsigned long long h_candidates = 0;
+        cpu_brute_force_collide(g_host_balls, g_object_count, &h_collisions, &h_candidates);
+        const double t1 = timer_now_ms();
+
+        CUDA_CHECK(cudaMemcpy(g_balls, g_host_balls,
+                              (size_t)g_object_count * sizeof(DeviceBall),
+                              cudaMemcpyHostToDevice));
+
+        CUDA_CHECK(cudaGraphicsMapResources(1, &g_vbo_resource, 0));
+        CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&vertices, &mapped_size, g_vbo_resource));
+        write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaGraphicsUnmapResources(1, &g_vbo_resource, 0));
+
+        metrics->collision_count = h_collisions;
+        metrics->candidate_pair_count = h_candidates;
+        metrics->gpu_time_ms = (float)(t1 - t0);
+        return 1;
+    }
 
     CUDA_CHECK(cudaMemset(g_collision_count, 0, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(g_candidate_pair_count, 0, sizeof(unsigned long long)));

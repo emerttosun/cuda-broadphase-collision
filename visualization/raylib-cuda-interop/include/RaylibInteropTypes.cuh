@@ -6,7 +6,8 @@ extern "C" {
 
 typedef enum VisualizerMode {
     VISUALIZER_MODE_CUDA_BRUTE_FORCE = 0,
-    VISUALIZER_MODE_CUDA_UNIFORM_GRID = 1
+    VISUALIZER_MODE_CUDA_UNIFORM_GRID = 1,
+    VISUALIZER_MODE_CPU_BRUTE_FORCE = 2
 } VisualizerMode;
 
 typedef struct RenderVertex {

@@ -64,11 +64,30 @@ static void draw_particles(unsigned int vao, unsigned int shader_program, int ob
     rlDisableShader();
 }
 
+static const int kCountStep = 500;
+static const int kCountMin = 100;
+static const int kCountMax = 20000;
+
 static const char* mode_name(int mode) {
-    if (mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
-        return "cuda_uniform_grid";
+    switch (mode) {
+        case VISUALIZER_MODE_CUDA_UNIFORM_GRID: return "cuda_uniform_grid";
+        case VISUALIZER_MODE_CPU_BRUTE_FORCE:   return "cpu_brute_force";
+        default:                                return "cuda_brute_force";
     }
-    return "cuda_brute_force";
+}
+
+static int recreate_simulation(unsigned int* vao, unsigned int* vbo,
+                               int new_count, int mode, int clustered) {
+    cuda_visualizer_destroy();
+    rlUnloadVertexBuffer(*vbo);
+    rlUnloadVertexArray(*vao);
+    create_particle_buffers(vao, vbo, new_count);
+    if (!cuda_visualizer_create(*vbo, new_count, kWindowWidth, kWindowHeight)) {
+        return 0;
+    }
+    cuda_visualizer_set_mode(mode);
+    cuda_visualizer_reset(clustered);
+    return 1;
 }
 
 int main(int argc, char** argv) {
@@ -116,11 +135,26 @@ int main(int argc, char** argv) {
             cuda_visualizer_reset(clustered);
         }
         if (IsKeyPressed(KEY_G)) {
-            mode = (mode == VISUALIZER_MODE_CUDA_BRUTE_FORCE)
-                       ? VISUALIZER_MODE_CUDA_UNIFORM_GRID
-                       : VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+            mode = (mode + 1) % 3;
             cuda_visualizer_set_mode(mode);
         }
+
+        int new_count = object_count;
+        if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {
+            new_count = object_count + kCountStep;
+            if (new_count > kCountMax) new_count = kCountMax;
+        }
+        if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) {
+            new_count = object_count - kCountStep;
+            if (new_count < kCountMin) new_count = kCountMin;
+        }
+        if (new_count != object_count) {
+            if (recreate_simulation(&vao, &vbo, new_count, mode, clustered)) {
+                object_count = new_count;
+                memset(&metrics, 0, sizeof(metrics));
+            }
+        }
+
         if (!paused) {
             cuda_visualizer_step(GetFrameTime(), &metrics);
         }
@@ -129,14 +163,18 @@ int main(int argc, char** argv) {
         ClearBackground((Color){8, 10, 14, 255});
         draw_particles(vao, particle_shader, object_count);
 
-        DrawRectangle(12, 12, 480, 196, (Color){18, 22, 30, 220});
+        const char* compute_label =
+            (mode == VISUALIZER_MODE_CPU_BRUTE_FORCE) ? "CPU compute" : "CUDA compute";
+
+        DrawRectangle(12, 12, 480, 220, (Color){18, 22, 30, 220});
         DrawText("Raylib + CUDA-OpenGL Interop", 24, 24, 20, RAYWHITE);
-        DrawText(TextFormat("Objects: %d", object_count), 24, 52, 18, LIGHTGRAY);
+        DrawText(TextFormat("Objects: %d  [+/-]", object_count), 24, 52, 18, LIGHTGRAY);
         DrawText(TextFormat("Distribution: %s  [C]", clustered ? "clustered" : "uniform"), 24, 76, 18, LIGHTGRAY);
         DrawText(TextFormat("Method: %s  [G]", mode_name(mode)), 24, 100, 18, LIGHTGRAY);
         DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 124, 18, LIGHTGRAY);
         DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 148, 18, LIGHTGRAY);
-        DrawText(TextFormat("CUDA frame: %.3f ms", (double)metrics.gpu_time_ms), 24, 172, 18, LIGHTGRAY);
+        DrawText(TextFormat("%s: %.3f ms", compute_label, (double)metrics.gpu_time_ms), 24, 172, 18, LIGHTGRAY);
+        DrawText(TextFormat("FPS: %d", GetFPS()), 24, 196, 18, LIGHTGRAY);
 
         EndDrawing();
     }
