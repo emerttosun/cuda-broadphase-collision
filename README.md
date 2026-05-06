@@ -11,9 +11,16 @@ CPU baseline, CUDA brute force ve CUDA uniform-grid yöntemleri için 2B daire �
 - **CMake ≥ 3.24** (`winget install Kitware.CMake`).
 - **CUDA Toolkit 12.x** — https://developer.nvidia.com/cuda-toolkit-archive
   (GTX 10-serisi / Pascal için CUDA 12.x şart, CUDA 13+ Turing ve üstünü ister.)
-- **raylib kaynağı** `external/raylib` altında. Yoksa proje kökünden:
+- **raylib** — `external/raylib` altında **git submodule** olarak tutuluyor. Klonlarken submodule'leri de getir:
+
   ```powershell
-  git clone https://github.com/raysan5/raylib.git external/raylib
+  git clone --recurse-submodules https://github.com/emerttosun/cuda-broadphase-collision.git
+  ```
+
+  Daha önce `--recurse-submodules`'sız klonladıysan proje kökünde tek seferlik:
+
+  ```powershell
+  git submodule update --init --recursive
   ```
 
 vcpkg gerekmiyor — raylib projeyle birlikte kaynaktan derlenip statik linkleniyor.
