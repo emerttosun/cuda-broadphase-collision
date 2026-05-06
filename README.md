@@ -107,53 +107,135 @@ macOS is used only for writing code, Git management, README editing, and report 
 
 ## Build With CMake
 
-On a CUDA-capable machine:
+Prerequisites:
+
+- **Visual Studio 2022** (Community/Pro/Enterprise) with the "Desktop development with C++" workload — this provides MSVC, the Windows SDK, and MSBuild.
+- **CMake 3.23 or newer** (`winget install Kitware.CMake` if you don't have it).
+- **CUDA Toolkit 12.x** (Windows installer at https://developer.nvidia.com/cuda-toolkit-archive). Pick a version that matches your GPU: CUDA 13+ requires a Turing (sm_75) or newer GPU, while CUDA 12.x still supports Pascal (GTX 10-series) and Volta. The default preset targets CUDA 12.1 for the broadest GPU coverage.
+- **A `raylib` source clone next to this project** (only needed for the visualizer):
+  ```powershell
+  cd ..
+  git clone https://github.com/raysan5/raylib.git
+  ```
+  After cloning, the layout should be `parent/CMP674/` and `parent/raylib/` — the build system looks for raylib at `../raylib` automatically.
+
+The build is driven by a `CMakePresets.json` file in the project root, so you do **not** need vcpkg, a toolchain file, or any custom `-D` flags. Two commands and you're done.
+
+### Quick start
+
+From the project root (`CMP674/`):
+
+```powershell
+cmake --preset default              # Configure (~20 s)
+cmake --build --preset default      # Build benchmark + visualizer (~3-5 min first time)
+```
+
+That single configure step:
+
+1. Auto-detects the `raylib` source clone next to the project.
+2. Picks an installed CUDA 12.x toolkit on Windows (preset locks v12.1; see below to change).
+3. Selects the matching Visual Studio CUDA toolset so MSBuild loads `CUDA <ver>.targets` correctly.
+4. Sets `CMAKE_POLICY_VERSION_MINIMUM` so raylib's bundled GLFW (which still uses `cmake_minimum_required(VERSION 3.0)`) configures cleanly under modern CMake.
+5. Defaults `BUILD_VISUALIZER=ON` because raylib was found.
+
+After the build, the artifacts are:
+
+```text
+build\Release\collision_benchmark.exe
+build\visualization\raylib-cuda-interop\Release\raylib_cuda_visualizer.exe
+```
+
+Run them:
+
+```powershell
+.\build\Release\collision_benchmark.exe
+.\build\visualization\raylib-cuda-interop\Release\raylib_cuda_visualizer.exe
+```
+
+The CSV output is written to `results/timings.csv` relative to the working directory you ran the binary from (so the example above writes `build\Release\results\timings.csv`).
+
+### Available presets
+
+| Preset | What it does |
+| --- | --- |
+| `default` | Configure benchmark + visualizer, VS 2022 / x64 / CUDA 12.1 toolset. |
+| `benchmark-only` | Same toolchain as `default` but skips the visualizer (no raylib needed). |
+
+Use the second one with:
+
+```powershell
+cmake --preset benchmark-only
+cmake --build --preset benchmark-only
+```
+
+### Customizing the preset
+
+`CMakePresets.json` hardcodes the CUDA version and toolset path so the build "just works" on the development machine. You will likely need to edit it once for your own setup. The relevant fields are:
+
+```json
+"toolset": "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1",
+"cacheVariables": {
+    "CMAKE_CUDA_COMPILER": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/bin/nvcc.exe"
+}
+```
+
+Common edits:
+
+- **Different CUDA version**: change both occurrences of `v12.1` to whatever you have installed (e.g. `v12.6`). Both fields must agree.
+- **GPU compute capability**: by default the project compiles with `CMP674_CUDA_ARCHITECTURES=native`, which queries your local GPU at build time. If you want a fixed list (for portability or to skip an unsupported card), add to `cacheVariables`:
+  ```json
+  "CMP674_CUDA_ARCHITECTURES": "75;86;89"
+  ```
+  Use `61` for GTX 10-series, `75` for GTX 16xx / RTX 20xx, `86` for RTX 30xx, `89` for RTX 40xx.
+- **raylib in a non-standard location**: add to `cacheVariables`:
+  ```json
+  "RAYLIB_SOURCE_DIR": "C:/path/to/raylib"
+  ```
+  Otherwise the project searches `../raylib`, `./raylib`, and `./external/raylib`.
+- **Different Visual Studio**: change `"generator"` to `"Visual Studio 16 2019"` or whatever you have. The CUDA toolset path stays the same.
+
+After editing the preset, re-run `cmake --preset default` (or whatever preset name) to apply changes; old build directories should be wiped first if the toolset or generator changed:
+
+```powershell
+Remove-Item -Recurse -Force build
+cmake --preset default
+cmake --build --preset default
+```
+
+### Building without presets
+
+If you cannot use presets (CMake older than 3.23, or you want to script the flags yourself), the equivalent direct invocation is:
+
+```powershell
+cmake -S . -B build `
+    -G "Visual Studio 17 2022" -A x64 `
+    -T "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1" `
+    "-DCMAKE_CUDA_COMPILER=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/bin/nvcc.exe" `
+    -DBUILD_VISUALIZER=ON
+cmake --build build --config Release
+```
+
+On Linux, WSL2, or Google Colab (no Visual Studio toolset, just nvcc on PATH):
 
 ```bash
-cmake -B build
+cmake -S . -B build -DBUILD_VISUALIZER=ON
 cmake --build build -j
 ./build/collision_benchmark
 ```
 
-The CSV output is written to `results/timings.csv` relative to the working
-directory you run the binary from (so the example above writes
-`build/results/timings.csv`).
+This produces both `build/collision_benchmark` and `build/visualization/raylib-cuda-interop/raylib_cuda_visualizer`. They share the same `cmp674_core` build artifacts, so nothing is recompiled twice.
 
 ### Build options
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `BUILD_VISUALIZER` | `OFF` | Also build `raylib_cuda_visualizer`. Requires raylib and an interactive OpenGL/CUDA context. |
+| `BUILD_VISUALIZER` | `ON` if raylib source is found, otherwise `OFF` | Also build `raylib_cuda_visualizer`. Requires raylib and an interactive OpenGL/CUDA context. |
 | `CMP674_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) or `60;61;70;75;80;86;89` | Which compute capabilities to generate code for. |
-
-### Benchmark + visualizer in one configure
-
-```bash
-cmake -B build -DBUILD_VISUALIZER=ON \
-    -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build -j
-```
-
-This produces both `build/collision_benchmark` and
-`build/visualization/raylib-cuda-interop/raylib_cuda_visualizer`. The
-visualizer reuses the same `cmp674_core` build artifacts as the benchmark, so
-nothing is recompiled twice.
-
-### Visualizer-only build
-
-The visualizer's CMakeLists also works standalone for backwards
-compatibility:
-
-```bash
-cd visualization/raylib-cuda-interop
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build
-```
-
-In standalone mode the visualizer pulls in the parent project just to build
-`cmp674_core`; you still get the same shared library underneath.
+| `RAYLIB_SOURCE_DIR` | auto-detected at `../raylib` | Path to a raylib source clone, used as a CMake subproject. |
 
 ## Google Colab
+
+Colab provides a CUDA-capable Tesla T4 (sm_75) and CUDA 12.x preinstalled, so the build is as simple as it gets — no preset needed, just plain CMake. The visualizer is OFF by default in this path because Colab has no display server.
 
 ```python
 !nvidia-smi
@@ -181,6 +263,14 @@ It uses raylib for the window and UI overlay while CUDA maps an OpenGL VBO
 and writes particle vertices directly into it through CUDA-OpenGL interop.
 It links against the same `cmp674_core` library as the benchmark, so the
 collision math is shared.
+
+Run it from the project root after a visualizer build:
+
+```powershell
+.\build\visualization\raylib-cuda-interop\Release\raylib_cuda_visualizer.exe 2500
+```
+
+The optional `2500` argument is the number of circles to simulate.
 
 See [visualization/raylib-cuda-interop/README.md](visualization/raylib-cuda-interop/README.md) for build instructions, raylib install steps and the in-app keyboard controls.
 

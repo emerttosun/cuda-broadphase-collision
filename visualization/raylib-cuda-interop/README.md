@@ -77,8 +77,8 @@ standalone from this directory.
 
 ```powershell
 cd <repo root>
-cmake -B build -DBUILD_VISUALIZER=ON ^
-    -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+vcpkg install raylib:x64-windows
+cmake -S . -B build -DBUILD_VISUALIZER=ON -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 .\build\visualization\raylib-cuda-interop\Release\raylib_cuda_visualizer.exe 2500
 ```
@@ -95,7 +95,8 @@ build `cmp674_core`.
 
 ```powershell
 cd visualization/raylib-cuda-interop
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+vcpkg install raylib:x64-windows
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 .\build\Release\raylib_cuda_visualizer.exe 2500
 ```
@@ -105,7 +106,7 @@ this repository:
 
 ```powershell
 git clone --depth 1 https://github.com/raysan5/raylib.git C:/path/to/raylib
-cmake -B build -DBUILD_VISUALIZER=ON -DRAYLIB_SOURCE_DIR=C:/path/to/raylib
+cmake -S . -B build -DBUILD_VISUALIZER=ON -DRAYLIB_SOURCE_DIR=C:/path/to/raylib
 cmake --build build --config Release
 ```
 

@@ -1,0 +1,39 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "default",
+            "displayName": "Windows / VS 2022 / CUDA 12.1 (GTX 10xx-friendly)",
+            "description": "Single-command build: configure benchmark + visualizer with raylib auto-detected at ../raylib and CUDA 12.1 toolset.",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build",
+            "toolset": "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1",
+            "cacheVariables": {
+                "CMAKE_CUDA_COMPILER": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/bin/nvcc.exe",
+                "BUILD_VISUALIZER": "ON"
+            }
+        },
+        {
+            "name": "benchmark-only",
+            "inherits": "default",
+            "displayName": "Benchmark only (no visualizer)",
+            "cacheVariables": { "BUILD_VISUALIZER": "OFF" }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "default",
+            "configurePreset": "default",
+            "configuration": "Release",
+            "jobs": 0
+        },
+        {
+            "name": "benchmark-only",
+            "configurePreset": "benchmark-only",
+            "configuration": "Release",
+            "jobs": 0
+        }
+    ]
+}
