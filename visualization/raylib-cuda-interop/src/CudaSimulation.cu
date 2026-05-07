@@ -24,8 +24,10 @@
 typedef struct DeviceBall {
     float x;
     float y;
+    float z;
     float vx;
     float vy;
+    float vz;
     float radius;
     int colliding;
 } DeviceBall;
@@ -35,9 +37,17 @@ typedef struct DeviceBall {
 #define VISUALIZER_BALL_MAX_RADIUS 7.0f
 #define VISUALIZER_GRID_CELL_SIZE 16.0f
 #define VISUALIZER_INIT_SEED 202405u
+#define VISUALIZER_MOUSE_RADIUS 54.0f
+#define VISUALIZER_MOUSE_PUSH_SPEED 320.0f
 
 static DeviceBall* g_balls = NULL;
 static DeviceBall* g_host_balls = NULL;
+static float* g_collision_delta_vx = NULL;
+static float* g_collision_delta_vy = NULL;
+static float* g_collision_delta_vz = NULL;
+static float* g_collision_delta_x = NULL;
+static float* g_collision_delta_y = NULL;
+static float* g_collision_delta_z = NULL;
 static unsigned long long* g_collision_count = NULL;
 static unsigned long long* g_candidate_pair_count = NULL;
 static int* g_cell_keys = NULL;
@@ -60,12 +70,28 @@ static cudaEvent_t g_stop_event = NULL;
 static int g_object_count = 0;
 static int g_width = 1280;
 static int g_height = 720;
+static float g_depth = 540.0f;
 static int g_grid_width = 0;
 static int g_grid_height = 0;
 static int g_total_cells = 0;
 static int g_mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
 
-__global__ static void integrate_kernel(DeviceBall* balls, int count, float dt, int width, int height) {
+__device__ __host__ static int balls_overlap_3d(const DeviceBall* a, const DeviceBall* b) {
+    const float dx = a->x - b->x;
+    const float dy = a->y - b->y;
+    const float dz = a->z - b->z;
+    const float radius_sum = a->radius + b->radius;
+    const float distance_squared = dx * dx + dy * dy + dz * dz;
+    return distance_squared <= radius_sum * radius_sum;
+}
+
+__global__ static void integrate_kernel(
+    DeviceBall* balls,
+    int count,
+    float dt,
+    int width,
+    int height,
+    float depth) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) {
         return;
@@ -74,6 +100,7 @@ __global__ static void integrate_kernel(DeviceBall* balls, int count, float dt, 
     DeviceBall b = balls[i];
     b.x += b.vx * dt;
     b.y += b.vy * dt;
+    b.z += b.vz * dt;
 
     if (b.x < b.radius) {
         b.x = b.radius;
@@ -91,6 +118,14 @@ __global__ static void integrate_kernel(DeviceBall* balls, int count, float dt, 
         b.vy = -fabsf(b.vy);
     }
 
+    if (b.z < b.radius) {
+        b.z = b.radius;
+        b.vz = fabsf(b.vz);
+    } else if (b.z > depth - b.radius) {
+        b.z = depth - b.radius;
+        b.vz = -fabsf(b.vz);
+    }
+
     b.colliding = 0;
     balls[i] = b;
 }
@@ -103,9 +138,232 @@ __device__ static Circle ball_to_circle(const DeviceBall* b) {
     return c;
 }
 
+__device__ __host__ static void project_ball_to_screen(
+    const DeviceBall* b,
+    int width,
+    int height,
+    float depth,
+    float* screen_x,
+    float* screen_y,
+    float* sprite_radius) {
+    const float camera_distance = 900.0f;
+    const float perspective = camera_distance / (camera_distance + (depth - b->z));
+    const float depth_centered = b->z - depth * 0.5f;
+    *screen_x = ((b->x - width * 0.5f) + depth_centered * 0.38f) * perspective + width * 0.5f;
+    *screen_y = ((b->y - height * 0.5f) - depth_centered * 0.22f) * perspective + height * 0.5f;
+    *sprite_radius = fmaxf(8.0f, b->radius * 2.2f * perspective);
+}
+
+__device__ __host__ static void apply_bounds(DeviceBall* b, int width, int height, float depth) {
+    if (b->x < b->radius) {
+        b->x = b->radius;
+        b->vx = fabsf(b->vx);
+    } else if (b->x > width - b->radius) {
+        b->x = width - b->radius;
+        b->vx = -fabsf(b->vx);
+    }
+
+    if (b->y < b->radius) {
+        b->y = b->radius;
+        b->vy = fabsf(b->vy);
+    } else if (b->y > height - b->radius) {
+        b->y = height - b->radius;
+        b->vy = -fabsf(b->vy);
+    }
+
+    if (b->z < b->radius) {
+        b->z = b->radius;
+        b->vz = fabsf(b->vz);
+    } else if (b->z > depth - b->radius) {
+        b->z = depth - b->radius;
+        b->vz = -fabsf(b->vz);
+    }
+}
+
+__device__ static void accumulate_collision_response(
+    const DeviceBall* balls,
+    int a_index,
+    int b_index,
+    float* delta_vx,
+    float* delta_vy,
+    float* delta_vz,
+    float* delta_x,
+    float* delta_y,
+    float* delta_z) {
+    const DeviceBall a = balls[a_index];
+    const DeviceBall b = balls[b_index];
+    float nx = b.x - a.x;
+    float ny = b.y - a.y;
+    float nz = b.z - a.z;
+    const float radius_sum = a.radius + b.radius;
+    float distance_sq = nx * nx + ny * ny + nz * nz;
+
+    if (distance_sq < 1.0e-6f) {
+        const float fallback = (a_index < b_index) ? 1.0f : -1.0f;
+        nx = fallback;
+        ny = 0.0f;
+        nz = 0.0f;
+        distance_sq = 1.0f;
+    }
+
+    const float distance = sqrtf(distance_sq);
+    nx /= distance;
+    ny /= distance;
+    nz /= distance;
+
+    const float penetration = radius_sum - distance;
+    if (penetration > 0.0f) {
+        const float correction = penetration * 0.5f + 0.01f;
+        atomicAdd(&delta_x[a_index], -nx * correction);
+        atomicAdd(&delta_y[a_index], -ny * correction);
+        atomicAdd(&delta_z[a_index], -nz * correction);
+        atomicAdd(&delta_x[b_index], nx * correction);
+        atomicAdd(&delta_y[b_index], ny * correction);
+        atomicAdd(&delta_z[b_index], nz * correction);
+    }
+
+    const float rvx = a.vx - b.vx;
+    const float rvy = a.vy - b.vy;
+    const float rvz = a.vz - b.vz;
+    const float relative_speed = rvx * nx + rvy * ny + rvz * nz;
+    if (relative_speed <= 0.0f) {
+        return;
+    }
+
+    atomicAdd(&delta_vx[a_index], -relative_speed * nx);
+    atomicAdd(&delta_vy[a_index], -relative_speed * ny);
+    atomicAdd(&delta_vz[a_index], -relative_speed * nz);
+    atomicAdd(&delta_vx[b_index], relative_speed * nx);
+    atomicAdd(&delta_vy[b_index], relative_speed * ny);
+    atomicAdd(&delta_vz[b_index], relative_speed * nz);
+}
+
+__global__ static void apply_collision_response_kernel(
+    DeviceBall* balls,
+    int count,
+    const float* delta_vx,
+    const float* delta_vy,
+    const float* delta_vz,
+    const float* delta_x,
+    const float* delta_y,
+    const float* delta_z,
+    int width,
+    int height,
+    float depth) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+
+    DeviceBall b = balls[i];
+    b.vx += delta_vx[i];
+    b.vy += delta_vy[i];
+    b.vz += delta_vz[i];
+    b.x += delta_x[i];
+    b.y += delta_y[i];
+    b.z += delta_z[i];
+
+    if (b.x < b.radius) {
+        b.x = b.radius;
+        b.vx = fabsf(b.vx);
+    } else if (b.x > width - b.radius) {
+        b.x = width - b.radius;
+        b.vx = -fabsf(b.vx);
+    }
+
+    if (b.y < b.radius) {
+        b.y = b.radius;
+        b.vy = fabsf(b.vy);
+    } else if (b.y > height - b.radius) {
+        b.y = height - b.radius;
+        b.vy = -fabsf(b.vy);
+    }
+
+    if (b.z < b.radius) {
+        b.z = b.radius;
+        b.vz = fabsf(b.vz);
+    } else if (b.z > depth - b.radius) {
+        b.z = depth - b.radius;
+        b.vz = -fabsf(b.vz);
+    }
+
+    balls[i] = b;
+}
+
+__device__ __host__ static void apply_mouse_collision(
+    DeviceBall* b,
+    float mouse_x,
+    float mouse_y,
+    int width,
+    int height,
+    float depth) {
+    float screen_x = 0.0f;
+    float screen_y = 0.0f;
+    float sprite_radius = 0.0f;
+    project_ball_to_screen(b, width, height, depth, &screen_x, &screen_y, &sprite_radius);
+
+    float dx = screen_x - mouse_x;
+    float dy = screen_y - mouse_y;
+    float distance_sq = dx * dx + dy * dy;
+    const float collider_radius = VISUALIZER_MOUSE_RADIUS + sprite_radius;
+    if (distance_sq > collider_radius * collider_radius) {
+        return;
+    }
+
+    if (distance_sq < 1.0e-5f) {
+        dx = 1.0f;
+        dy = 0.0f;
+        distance_sq = 1.0f;
+    }
+
+    const float distance = sqrtf(distance_sq);
+    const float nx = dx / distance;
+    const float ny = dy / distance;
+    const float penetration = collider_radius - distance;
+    const float correction = penetration * 0.72f + 0.5f;
+    const float outward_speed = b->vx * nx + b->vy * ny;
+    const float impulse = fmaxf(0.0f, VISUALIZER_MOUSE_PUSH_SPEED - outward_speed);
+
+    b->x += nx * correction;
+    b->y += ny * correction;
+    b->vx += nx * impulse;
+    b->vy += ny * impulse;
+    b->colliding = 1;
+    apply_bounds(b, width, height, depth);
+}
+
+__global__ static void mouse_collision_kernel(
+    DeviceBall* balls,
+    int count,
+    float mouse_x,
+    float mouse_y,
+    int mouse_active,
+    int width,
+    int height,
+    float depth) {
+    if (!mouse_active) {
+        return;
+    }
+
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+
+    DeviceBall b = balls[i];
+    apply_mouse_collision(&b, mouse_x, mouse_y, width, height, depth);
+    balls[i] = b;
+}
+
 __global__ static void brute_force_collision_kernel(
     DeviceBall* balls,
     int count,
+    float* delta_vx,
+    float* delta_vy,
+    float* delta_vz,
+    float* delta_x,
+    float* delta_y,
+    float* delta_z,
     unsigned long long* collision_count,
     unsigned long long* candidate_pair_count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -123,9 +381,13 @@ __global__ static void brute_force_collision_kernel(
         const Circle b_circle = ball_to_circle(&b);
         local_candidates++;
 
-        if (circles_overlap(&a_circle, &b_circle)) {
+        if (balls_overlap_3d(&a, &b)) {
             balls[i].colliding = 1;
             balls[j].colliding = 1;
+            accumulate_collision_response(
+                balls, i, j,
+                delta_vx, delta_vy, delta_vz,
+                delta_x, delta_y, delta_z);
             local_collisions++;
         }
     }
@@ -198,6 +460,12 @@ __global__ static void grid_collision_kernel(
     int count,
     int grid_width,
     int grid_height,
+    float* delta_vx,
+    float* delta_vy,
+    float* delta_vz,
+    float* delta_x,
+    float* delta_y,
+    float* delta_z,
     unsigned long long* collision_count,
     unsigned long long* candidate_pair_count) {
     const int sorted_pos = blockIdx.x * blockDim.x + threadIdx.x;
@@ -238,9 +506,13 @@ __global__ static void grid_collision_kernel(
                 local_candidates++;
                 const DeviceBall other = balls[other_index];
                 const Circle other_circle = ball_to_circle(&other);
-                if (circles_overlap(&self_circle, &other_circle)) {
+                if (balls_overlap_3d(&self, &other)) {
                     balls[object_index].colliding = 1;
                     balls[other_index].colliding = 1;
+                    accumulate_collision_response(
+                        balls, object_index, other_index,
+                        delta_vx, delta_vy, delta_vz,
+                        delta_x, delta_y, delta_z);
                     local_collisions++;
                 }
             }
@@ -417,6 +689,12 @@ __global__ static void lbvh_traverse_kernel(
     const float* aabb_min_y,
     const float* aabb_max_x,
     const float* aabb_max_y,
+    float* delta_vx,
+    float* delta_vy,
+    float* delta_vz,
+    float* delta_x,
+    float* delta_y,
+    float* delta_z,
     unsigned long long* collision_count,
     unsigned long long* candidate_pair_count) {
     const int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -452,9 +730,13 @@ __global__ static void lbvh_traverse_kernel(
                 const int other_obj = indices[other_leaf];
                 const DeviceBall other = balls[other_obj];
                 const Circle other_circle = ball_to_circle(&other);
-                if (circles_overlap(&self_circle, &other_circle)) {
+                if (balls_overlap_3d(&self, &other)) {
                     balls[obj_idx].colliding = 1;
                     balls[other_obj].colliding = 1;
+                    accumulate_collision_response(
+                        balls, obj_idx, other_obj,
+                        delta_vx, delta_vy, delta_vz,
+                        delta_x, delta_y, delta_z);
                     ++local_collisions;
                 }
             }
@@ -477,17 +759,23 @@ __global__ static void write_vbo_kernel(
     RenderVertex* vertices,
     int count,
     int width,
-    int height) {
+    int height,
+    float depth) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) {
         return;
     }
 
     const DeviceBall b = balls[i];
-    const float center_x = (b.x / (float)width) * 2.0f - 1.0f;
-    const float center_y = 1.0f - (b.y / (float)height) * 2.0f;
-    const float radius_x = fmaxf(9.0f, b.radius * 2.0f) / (float)width * 2.0f;
-    const float radius_y = fmaxf(9.0f, b.radius * 2.0f) / (float)height * 2.0f;
+    float projected_x = 0.0f;
+    float projected_y = 0.0f;
+    float sprite_radius = 0.0f;
+    project_ball_to_screen(&b, width, height, depth, &projected_x, &projected_y, &sprite_radius);
+    const float center_x = (projected_x / (float)width) * 2.0f - 1.0f;
+    const float center_y = 1.0f - (projected_y / (float)height) * 2.0f;
+    const float radius_x = sprite_radius / (float)width * 2.0f;
+    const float radius_y = sprite_radius / (float)height * 2.0f;
+    const float vertex_depth = fminf(0.95f, fmaxf(-0.95f, b.z / depth * 1.9f - 0.95f));
 
     float r = 0.18f;
     float g = 0.78f;
@@ -513,6 +801,7 @@ __global__ static void write_vbo_kernel(
         const float local_y = corners[vertex_index][1];
         vertices[base + vertex_index].x = center_x + local_x * radius_x;
         vertices[base + vertex_index].y = center_y + local_y * radius_y;
+        vertices[base + vertex_index].depth = vertex_depth;
         vertices[base + vertex_index].local_x = local_x;
         vertices[base + vertex_index].local_y = local_y;
         vertices[base + vertex_index].r = r;
@@ -526,10 +815,12 @@ static void host_init_balls(DeviceBall* h_balls, int count, int clustered, unsig
 
     float centers_x[VISUALIZER_MAX_CLUSTERS];
     float centers_y[VISUALIZER_MAX_CLUSTERS];
+    float centers_z[VISUALIZER_MAX_CLUSTERS];
     if (clustered) {
         for (int i = 0; i < VISUALIZER_MAX_CLUSTERS; ++i) {
             centers_x[i] = rng_range_float(&rng, (float)g_width * 0.15f, (float)g_width * 0.85f);
             centers_y[i] = rng_range_float(&rng, (float)g_height * 0.15f, (float)g_height * 0.85f);
+            centers_z[i] = rng_range_float(&rng, g_depth * 0.15f, g_depth * 0.85f);
         }
     }
 
@@ -537,36 +828,45 @@ static void host_init_balls(DeviceBall* h_balls, int count, int clustered, unsig
         const float radius = rng_range_float(&rng, VISUALIZER_BALL_MIN_RADIUS, VISUALIZER_BALL_MAX_RADIUS);
         float x;
         float y;
+        float z;
         if (clustered) {
             const int cluster = (int)(rng_next_u32(&rng) % (unsigned int)VISUALIZER_MAX_CLUSTERS);
             const float angle = rng_range_float(&rng, 0.0f, 6.28318530718f);
+            const float z_angle = rng_range_float(&rng, -1.57079632679f, 1.57079632679f);
             const float distance = rng_range_float(&rng, 0.0f, 90.0f);
             x = centers_x[cluster] + cosf(angle) * distance;
             y = centers_y[cluster] + sinf(angle) * distance;
+            z = centers_z[cluster] + sinf(z_angle) * distance;
         } else {
             x = rng_range_float(&rng, radius, (float)g_width - radius);
             y = rng_range_float(&rng, radius, (float)g_height - radius);
+            z = rng_range_float(&rng, radius, g_depth - radius);
         }
 
         if (x < radius) x = radius;
         if (x > (float)g_width - radius) x = (float)g_width - radius;
         if (y < radius) y = radius;
         if (y > (float)g_height - radius) y = (float)g_height - radius;
+        if (z < radius) z = radius;
+        if (z > g_depth - radius) z = g_depth - radius;
 
         h_balls[i].x = x;
         h_balls[i].y = y;
+        h_balls[i].z = z;
         h_balls[i].vx = rng_range_float(&rng, -90.0f, 90.0f);
         h_balls[i].vy = rng_range_float(&rng, -90.0f, 90.0f);
+        h_balls[i].vz = rng_range_float(&rng, -90.0f, 90.0f);
         h_balls[i].radius = radius;
         h_balls[i].colliding = 0;
     }
 }
 
-static void cpu_integrate(DeviceBall* balls, int count, float dt, int width, int height) {
+static void cpu_integrate(DeviceBall* balls, int count, float dt, int width, int height, float depth) {
     for (int i = 0; i < count; ++i) {
         DeviceBall* b = &balls[i];
         b->x += b->vx * dt;
         b->y += b->vy * dt;
+        b->z += b->vz * dt;
         if (b->x < b->radius) {
             b->x = b->radius;
             b->vx = fabsf(b->vx);
@@ -581,7 +881,107 @@ static void cpu_integrate(DeviceBall* balls, int count, float dt, int width, int
             b->y = (float)height - b->radius;
             b->vy = -fabsf(b->vy);
         }
+        if (b->z < b->radius) {
+            b->z = b->radius;
+            b->vz = fabsf(b->vz);
+        } else if (b->z > depth - b->radius) {
+            b->z = depth - b->radius;
+            b->vz = -fabsf(b->vz);
+        }
         b->colliding = 0;
+    }
+}
+
+static void cpu_apply_collision_response(DeviceBall* balls, int a_index, int b_index) {
+    DeviceBall* a = &balls[a_index];
+    DeviceBall* b = &balls[b_index];
+    float nx = b->x - a->x;
+    float ny = b->y - a->y;
+    float nz = b->z - a->z;
+    const float radius_sum = a->radius + b->radius;
+    float distance_sq = nx * nx + ny * ny + nz * nz;
+
+    if (distance_sq < 1.0e-6f) {
+        nx = (a_index < b_index) ? 1.0f : -1.0f;
+        ny = 0.0f;
+        nz = 0.0f;
+        distance_sq = 1.0f;
+    }
+
+    const float distance = sqrtf(distance_sq);
+    nx /= distance;
+    ny /= distance;
+    nz /= distance;
+
+    const float penetration = radius_sum - distance;
+    if (penetration > 0.0f) {
+        const float correction = penetration * 0.5f + 0.01f;
+        a->x -= nx * correction;
+        a->y -= ny * correction;
+        a->z -= nz * correction;
+        b->x += nx * correction;
+        b->y += ny * correction;
+        b->z += nz * correction;
+    }
+
+    const float rvx = a->vx - b->vx;
+    const float rvy = a->vy - b->vy;
+    const float rvz = a->vz - b->vz;
+    const float relative_speed = rvx * nx + rvy * ny + rvz * nz;
+    if (relative_speed <= 0.0f) {
+        return;
+    }
+
+    a->vx -= relative_speed * nx;
+    a->vy -= relative_speed * ny;
+    a->vz -= relative_speed * nz;
+    b->vx += relative_speed * nx;
+    b->vy += relative_speed * ny;
+    b->vz += relative_speed * nz;
+}
+
+static void cpu_clamp_to_bounds(DeviceBall* balls, int count, int width, int height, float depth) {
+    for (int i = 0; i < count; ++i) {
+        DeviceBall* b = &balls[i];
+        if (b->x < b->radius) {
+            b->x = b->radius;
+            b->vx = fabsf(b->vx);
+        } else if (b->x > (float)width - b->radius) {
+            b->x = (float)width - b->radius;
+            b->vx = -fabsf(b->vx);
+        }
+        if (b->y < b->radius) {
+            b->y = b->radius;
+            b->vy = fabsf(b->vy);
+        } else if (b->y > (float)height - b->radius) {
+            b->y = (float)height - b->radius;
+            b->vy = -fabsf(b->vy);
+        }
+        if (b->z < b->radius) {
+            b->z = b->radius;
+            b->vz = fabsf(b->vz);
+        } else if (b->z > depth - b->radius) {
+            b->z = depth - b->radius;
+            b->vz = -fabsf(b->vz);
+        }
+    }
+}
+
+static void cpu_apply_mouse_collision(
+    DeviceBall* balls,
+    int count,
+    float mouse_x,
+    float mouse_y,
+    int mouse_active,
+    int width,
+    int height,
+    float depth) {
+    if (!mouse_active) {
+        return;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        apply_mouse_collision(&balls[i], mouse_x, mouse_y, width, height, depth);
     }
 }
 
@@ -593,19 +993,12 @@ static void cpu_brute_force_collide(
     unsigned long long collisions = 0;
     unsigned long long candidates = 0;
     for (int i = 0; i < count; ++i) {
-        Circle a;
-        a.x = balls[i].x;
-        a.y = balls[i].y;
-        a.radius = balls[i].radius;
         for (int j = i + 1; j < count; ++j) {
-            Circle b;
-            b.x = balls[j].x;
-            b.y = balls[j].y;
-            b.radius = balls[j].radius;
             ++candidates;
-            if (circles_overlap(&a, &b)) {
+            if (balls_overlap_3d(&balls[i], &balls[j])) {
                 balls[i].colliding = 1;
                 balls[j].colliding = 1;
+                cpu_apply_collision_response(balls, i, j);
                 ++collisions;
             }
         }
@@ -618,6 +1011,12 @@ static void run_brute_force(int blocks, int threads) {
     brute_force_collision_kernel<<<blocks, threads>>>(
         g_balls,
         g_object_count,
+        g_collision_delta_vx,
+        g_collision_delta_vy,
+        g_collision_delta_vz,
+        g_collision_delta_x,
+        g_collision_delta_y,
+        g_collision_delta_z,
         g_collision_count,
         g_candidate_pair_count);
     CUDA_CHECK(cudaGetLastError());
@@ -654,6 +1053,12 @@ static void run_uniform_grid(int blocks, int threads) {
         g_object_count,
         g_grid_width,
         g_grid_height,
+        g_collision_delta_vx,
+        g_collision_delta_vy,
+        g_collision_delta_vz,
+        g_collision_delta_x,
+        g_collision_delta_y,
+        g_collision_delta_z,
         g_collision_count,
         g_candidate_pair_count);
     CUDA_CHECK(cudaGetLastError());
@@ -696,6 +1101,8 @@ static void run_lbvh(int blocks, int threads) {
         g_lbvh_left, g_lbvh_right,
         g_lbvh_aabb_min_x, g_lbvh_aabb_min_y,
         g_lbvh_aabb_max_x, g_lbvh_aabb_max_y,
+        g_collision_delta_vx, g_collision_delta_vy, g_collision_delta_vz,
+        g_collision_delta_x, g_collision_delta_y, g_collision_delta_z,
         g_collision_count, g_candidate_pair_count);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -704,6 +1111,7 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     g_object_count = object_count;
     g_width = width;
     g_height = height;
+    g_depth = fminf((float)width, (float)height) * 0.75f;
     g_grid_width = (int)ceilf((float)width / VISUALIZER_GRID_CELL_SIZE);
     g_grid_height = (int)ceilf((float)height / VISUALIZER_GRID_CELL_SIZE);
     g_total_cells = g_grid_width * g_grid_height;
@@ -713,6 +1121,12 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     if (g_host_balls == NULL) {
         return 0;
     }
+    CUDA_CHECK(cudaMalloc((void**)&g_collision_delta_vx, (size_t)object_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_collision_delta_vy, (size_t)object_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_collision_delta_vz, (size_t)object_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_collision_delta_x, (size_t)object_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_collision_delta_y, (size_t)object_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_collision_delta_z, (size_t)object_count * sizeof(float)));
     CUDA_CHECK(cudaMalloc((void**)&g_collision_count, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void**)&g_candidate_pair_count, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void**)&g_cell_keys, (size_t)object_count * sizeof(int)));
@@ -751,6 +1165,30 @@ extern "C" void cuda_visualizer_destroy(void) {
     if (g_host_balls != NULL) {
         free(g_host_balls);
         g_host_balls = NULL;
+    }
+    if (g_collision_delta_vx != NULL) {
+        CUDA_CHECK(cudaFree(g_collision_delta_vx));
+        g_collision_delta_vx = NULL;
+    }
+    if (g_collision_delta_vy != NULL) {
+        CUDA_CHECK(cudaFree(g_collision_delta_vy));
+        g_collision_delta_vy = NULL;
+    }
+    if (g_collision_delta_vz != NULL) {
+        CUDA_CHECK(cudaFree(g_collision_delta_vz));
+        g_collision_delta_vz = NULL;
+    }
+    if (g_collision_delta_x != NULL) {
+        CUDA_CHECK(cudaFree(g_collision_delta_x));
+        g_collision_delta_x = NULL;
+    }
+    if (g_collision_delta_y != NULL) {
+        CUDA_CHECK(cudaFree(g_collision_delta_y));
+        g_collision_delta_y = NULL;
+    }
+    if (g_collision_delta_z != NULL) {
+        CUDA_CHECK(cudaFree(g_collision_delta_z));
+        g_collision_delta_z = NULL;
     }
     if (g_collision_count != NULL) {
         CUDA_CHECK(cudaFree(g_collision_count));
@@ -852,7 +1290,12 @@ extern "C" int cuda_visualizer_set_mode(int mode) {
     return 1;
 }
 
-extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
+extern "C" int cuda_visualizer_step(
+    float dt,
+    float mouse_x,
+    float mouse_y,
+    int mouse_active,
+    VisualizerMetrics* metrics) {
     if (g_balls == NULL || g_vbo_resource == NULL || metrics == NULL) {
         return 0;
     }
@@ -868,10 +1311,20 @@ extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
                               cudaMemcpyDeviceToHost));
 
         const double t0 = timer_now_ms();
-        cpu_integrate(g_host_balls, g_object_count, dt, g_width, g_height);
+        cpu_integrate(g_host_balls, g_object_count, dt, g_width, g_height, g_depth);
         unsigned long long h_collisions = 0;
         unsigned long long h_candidates = 0;
         cpu_brute_force_collide(g_host_balls, g_object_count, &h_collisions, &h_candidates);
+        cpu_clamp_to_bounds(g_host_balls, g_object_count, g_width, g_height, g_depth);
+        cpu_apply_mouse_collision(
+            g_host_balls,
+            g_object_count,
+            mouse_x,
+            mouse_y,
+            mouse_active,
+            g_width,
+            g_height,
+            g_depth);
         const double t1 = timer_now_ms();
 
         CUDA_CHECK(cudaMemcpy(g_balls, g_host_balls,
@@ -880,7 +1333,7 @@ extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
 
         CUDA_CHECK(cudaGraphicsMapResources(1, &g_vbo_resource, 0));
         CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&vertices, &mapped_size, g_vbo_resource));
-        write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height);
+        write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height, g_depth);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &g_vbo_resource, 0));
 
@@ -892,9 +1345,15 @@ extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
 
     CUDA_CHECK(cudaMemset(g_collision_count, 0, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(g_candidate_pair_count, 0, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(g_collision_delta_vx, 0, (size_t)g_object_count * sizeof(float)));
+    CUDA_CHECK(cudaMemset(g_collision_delta_vy, 0, (size_t)g_object_count * sizeof(float)));
+    CUDA_CHECK(cudaMemset(g_collision_delta_vz, 0, (size_t)g_object_count * sizeof(float)));
+    CUDA_CHECK(cudaMemset(g_collision_delta_x, 0, (size_t)g_object_count * sizeof(float)));
+    CUDA_CHECK(cudaMemset(g_collision_delta_y, 0, (size_t)g_object_count * sizeof(float)));
+    CUDA_CHECK(cudaMemset(g_collision_delta_z, 0, (size_t)g_object_count * sizeof(float)));
     CUDA_CHECK(cudaEventRecord(g_start_event));
 
-    integrate_kernel<<<blocks, threads>>>(g_balls, g_object_count, dt, g_width, g_height);
+    integrate_kernel<<<blocks, threads>>>(g_balls, g_object_count, dt, g_width, g_height, g_depth);
     CUDA_CHECK(cudaGetLastError());
 
     if (g_mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
@@ -905,9 +1364,34 @@ extern "C" int cuda_visualizer_step(float dt, VisualizerMetrics* metrics) {
         run_brute_force(blocks, threads);
     }
 
+    apply_collision_response_kernel<<<blocks, threads>>>(
+        g_balls,
+        g_object_count,
+        g_collision_delta_vx,
+        g_collision_delta_vy,
+        g_collision_delta_vz,
+        g_collision_delta_x,
+        g_collision_delta_y,
+        g_collision_delta_z,
+        g_width,
+        g_height,
+        g_depth);
+    CUDA_CHECK(cudaGetLastError());
+
+    mouse_collision_kernel<<<blocks, threads>>>(
+        g_balls,
+        g_object_count,
+        mouse_x,
+        mouse_y,
+        mouse_active,
+        g_width,
+        g_height,
+        g_depth);
+    CUDA_CHECK(cudaGetLastError());
+
     CUDA_CHECK(cudaGraphicsMapResources(1, &g_vbo_resource, 0));
     CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&vertices, &mapped_size, g_vbo_resource));
-    write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height);
+    write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height, g_depth);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaGraphicsUnmapResources(1, &g_vbo_resource, 0));
 

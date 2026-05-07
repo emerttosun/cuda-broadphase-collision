@@ -14,6 +14,7 @@ typedef enum VisualizerMode {
 typedef struct RenderVertex {
     float x;
     float y;
+    float depth;
     float local_x;
     float local_y;
     float r;
@@ -31,7 +32,7 @@ int cuda_visualizer_create(unsigned int vbo, int object_count, int width, int he
 void cuda_visualizer_destroy(void);
 int cuda_visualizer_reset(int clustered);
 int cuda_visualizer_set_mode(int mode);
-int cuda_visualizer_step(float dt, VisualizerMetrics* metrics);
+int cuda_visualizer_step(float dt, float mouse_x, float mouse_y, int mouse_active, VisualizerMetrics* metrics);
 
 #ifdef __cplusplus
 }
