@@ -73,6 +73,7 @@ static int g_height = 720;
 static float g_depth = 540.0f;
 static int g_grid_width = 0;
 static int g_grid_height = 0;
+static int g_grid_depth = 0;
 static int g_total_cells = 0;
 static int g_mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
 
@@ -424,6 +425,26 @@ __global__ static void compute_cell_keys_kernel(
     indices[i] = i;
 }
 
+__global__ static void compute_cell_keys_3d_kernel(
+    const DeviceBall* balls,
+    int* cell_keys,
+    int* indices,
+    int count,
+    float cell_size,
+    int grid_width,
+    int grid_height,
+    int grid_depth) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    const int cell_x = clamp_int_device((int)floorf(balls[i].x / cell_size), 0, grid_width - 1);
+    const int cell_y = clamp_int_device((int)floorf(balls[i].y / cell_size), 0, grid_height - 1);
+    const int cell_z = clamp_int_device((int)floorf(balls[i].z / cell_size), 0, grid_depth - 1);
+    cell_keys[i] = (cell_z * grid_height + cell_y) * grid_width + cell_x;
+    indices[i] = i;
+}
+
 __global__ static void init_cell_ranges_kernel(int* cell_start, int* cell_end, int total_cells) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total_cells) {
@@ -514,6 +535,88 @@ __global__ static void grid_collision_kernel(
                         delta_vx, delta_vy, delta_vz,
                         delta_x, delta_y, delta_z);
                     local_collisions++;
+                }
+            }
+        }
+    }
+
+    if (local_candidates > 0) {
+        atomicAdd(candidate_pair_count, local_candidates);
+    }
+    if (local_collisions > 0) {
+        atomicAdd(collision_count, local_collisions);
+    }
+}
+
+__global__ static void grid_collision_3d_kernel(
+    DeviceBall* balls,
+    const int* sorted_cell_keys,
+    const int* sorted_indices,
+    const int* cell_start,
+    const int* cell_end,
+    int count,
+    int grid_width,
+    int grid_height,
+    int grid_depth,
+    float* delta_vx,
+    float* delta_vy,
+    float* delta_vz,
+    float* delta_x,
+    float* delta_y,
+    float* delta_z,
+    unsigned long long* collision_count,
+    unsigned long long* candidate_pair_count) {
+    const int sorted_pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sorted_pos >= count) {
+        return;
+    }
+
+    const int object_index = sorted_indices[sorted_pos];
+    const DeviceBall self = balls[object_index];
+    const int cell_id = sorted_cell_keys[sorted_pos];
+    const int xy_cells = grid_width * grid_height;
+    const int cell_z = cell_id / xy_cells;
+    const int cell_xy = cell_id - cell_z * xy_cells;
+    const int cell_y = cell_xy / grid_width;
+    const int cell_x = cell_xy - cell_y * grid_width;
+
+    unsigned long long local_candidates = 0;
+    unsigned long long local_collisions = 0;
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int nx = cell_x + dx;
+                const int ny = cell_y + dy;
+                const int nz = cell_z + dz;
+                if (nx < 0 || ny < 0 || nz < 0
+                    || nx >= grid_width || ny >= grid_height || nz >= grid_depth) {
+                    continue;
+                }
+
+                const int neighbor_cell = (nz * grid_height + ny) * grid_width + nx;
+                const int start = cell_start[neighbor_cell];
+                const int end = cell_end[neighbor_cell];
+                if (start < 0 || end < 0) {
+                    continue;
+                }
+
+                for (int p = start; p < end; ++p) {
+                    const int other_index = sorted_indices[p];
+                    if (other_index <= object_index) {
+                        continue;
+                    }
+                    local_candidates++;
+                    const DeviceBall other = balls[other_index];
+                    if (balls_overlap_3d(&self, &other)) {
+                        balls[object_index].colliding = 1;
+                        balls[other_index].colliding = 1;
+                        accumulate_collision_response(
+                            balls, object_index, other_index,
+                            delta_vx, delta_vy, delta_vz,
+                            delta_x, delta_y, delta_z);
+                        local_collisions++;
+                    }
                 }
             }
         }
@@ -1064,6 +1167,50 @@ static void run_uniform_grid(int blocks, int threads) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+static void run_uniform_grid_3d(int blocks, int threads) {
+    const int cell_blocks = (g_total_cells + threads - 1) / threads;
+    init_cell_ranges_kernel<<<cell_blocks, threads>>>(g_cell_start, g_cell_end, g_total_cells);
+    CUDA_CHECK(cudaGetLastError());
+
+    compute_cell_keys_3d_kernel<<<blocks, threads>>>(
+        g_balls,
+        g_cell_keys,
+        g_indices,
+        g_object_count,
+        VISUALIZER_GRID_CELL_SIZE,
+        g_grid_width,
+        g_grid_height,
+        g_grid_depth);
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::device_ptr<int> keys_ptr(g_cell_keys);
+    thrust::device_ptr<int> indices_ptr(g_indices);
+    thrust::sort_by_key(keys_ptr, keys_ptr + g_object_count, indices_ptr);
+
+    build_cell_ranges_kernel<<<blocks, threads>>>(g_cell_keys, g_cell_start, g_cell_end, g_object_count);
+    CUDA_CHECK(cudaGetLastError());
+
+    grid_collision_3d_kernel<<<blocks, threads>>>(
+        g_balls,
+        g_cell_keys,
+        g_indices,
+        g_cell_start,
+        g_cell_end,
+        g_object_count,
+        g_grid_width,
+        g_grid_height,
+        g_grid_depth,
+        g_collision_delta_vx,
+        g_collision_delta_vy,
+        g_collision_delta_vz,
+        g_collision_delta_x,
+        g_collision_delta_y,
+        g_collision_delta_z,
+        g_collision_count,
+        g_candidate_pair_count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void run_lbvh(int blocks, int threads) {
     const int num_nodes = 2 * g_object_count - 1;
 
@@ -1114,7 +1261,8 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     g_depth = fminf((float)width, (float)height) * 0.75f;
     g_grid_width = (int)ceilf((float)width / VISUALIZER_GRID_CELL_SIZE);
     g_grid_height = (int)ceilf((float)height / VISUALIZER_GRID_CELL_SIZE);
-    g_total_cells = g_grid_width * g_grid_height;
+    g_grid_depth = (int)ceilf(g_depth / VISUALIZER_GRID_CELL_SIZE);
+    g_total_cells = g_grid_width * g_grid_height * g_grid_depth;
 
     CUDA_CHECK(cudaMalloc((void**)&g_balls, (size_t)object_count * sizeof(DeviceBall)));
     g_host_balls = (DeviceBall*)malloc((size_t)object_count * sizeof(DeviceBall));
@@ -1283,7 +1431,8 @@ extern "C" int cuda_visualizer_set_mode(int mode) {
     if (mode != VISUALIZER_MODE_CUDA_BRUTE_FORCE
         && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID
         && mode != VISUALIZER_MODE_CPU_BRUTE_FORCE
-        && mode != VISUALIZER_MODE_CUDA_LBVH) {
+        && mode != VISUALIZER_MODE_CUDA_LBVH
+        && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D) {
         return 0;
     }
     g_mode = mode;
@@ -1358,6 +1507,8 @@ extern "C" int cuda_visualizer_step(
 
     if (g_mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
         run_uniform_grid(blocks, threads);
+    } else if (g_mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D) {
+        run_uniform_grid_3d(blocks, threads);
     } else if (g_mode == VISUALIZER_MODE_CUDA_LBVH) {
         run_lbvh(blocks, threads);
     } else {
