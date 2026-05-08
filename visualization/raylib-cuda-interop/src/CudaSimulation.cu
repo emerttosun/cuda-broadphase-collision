@@ -636,22 +636,23 @@ __global__ static void grid_collision_3d_kernel(
 // [0 .. N-2], root = node 0. Sized arrays therefore have 2N-1 entries.
 // ---------------------------------------------------------------------------
 
-__device__ static unsigned int lbvh_expand_bits(unsigned int v) {
-    v = (v * 0x00010001u) & 0xFF0000FFu;
-    v = (v * 0x00000101u) & 0x0F00F00Fu;
-    v = (v * 0x00000011u) & 0xC30C30C3u;
-    v = (v * 0x00000005u) & 0x49249249u;
+__device__ static unsigned int lbvh_part_1_by_1(unsigned int v) {
+    v &= 0x0000FFFFu;
+    v = (v | (v << 8)) & 0x00FF00FFu;
+    v = (v | (v << 4)) & 0x0F0F0F0Fu;
+    v = (v | (v << 2)) & 0x33333333u;
+    v = (v | (v << 1)) & 0x55555555u;
     return v;
 }
 
 __device__ static unsigned int lbvh_morton2d(float x, float y, float scene_w, float scene_h) {
     float fx = x / scene_w;
     float fy = y / scene_h;
-    fx = fmaxf(0.0f, fminf(fx * 32768.0f, 32767.0f));
-    fy = fmaxf(0.0f, fminf(fy * 32768.0f, 32767.0f));
-    const unsigned int xx = lbvh_expand_bits((unsigned int)fx);
-    const unsigned int yy = lbvh_expand_bits((unsigned int)fy);
-    return xx * 2u + yy;
+    fx = fmaxf(0.0f, fminf(fx * 65536.0f, 65535.0f));
+    fy = fmaxf(0.0f, fminf(fy * 65536.0f, 65535.0f));
+    const unsigned int xx = lbvh_part_1_by_1((unsigned int)fx);
+    const unsigned int yy = lbvh_part_1_by_1((unsigned int)fy);
+    return (xx << 1) | yy;
 }
 
 __device__ static int lbvh_common_upper_bits(const unsigned int* morton_codes, int count, int i, int j) {

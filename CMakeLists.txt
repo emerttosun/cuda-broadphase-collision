@@ -41,6 +41,7 @@ add_library(cmp674_core STATIC
     src/CpuCollision.c
     src/CudaBruteForce.cu
     src/CudaGrid.cu
+    src/CudaLbvh.cu
 )
 target_include_directories(cmp674_core PUBLIC include)
 set_target_properties(cmp674_core PROPERTIES
@@ -65,6 +66,17 @@ set_target_properties(collision_benchmark PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CUDA_ARCHITECTURES "${CMP674_CUDA_ARCHITECTURES}"
 )
+
+enable_testing()
+add_executable(collision_parity_test tests/test_parity.c)
+target_link_libraries(collision_parity_test PRIVATE cmp674_core)
+set_target_properties(collision_parity_test PROPERTIES
+    LINKER_LANGUAGE CUDA
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    CUDA_ARCHITECTURES "${CMP674_CUDA_ARCHITECTURES}"
+)
+add_test(NAME collision_parity_test COMMAND collision_parity_test)
 
 # ---- raylib_cuda_visualizer: optional live demo ----
 if(BUILD_VISUALIZER)

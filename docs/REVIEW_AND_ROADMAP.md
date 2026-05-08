@@ -273,7 +273,119 @@ işler.
 - **"Rethinking Collision Detection on GPU Ray Tracing Architecture"**
   ([arXiv 2604.23520](https://arxiv.org/html/2604.23520v1)).
 
-### D. Yardımcı / arka plan
+### D. Ek literatür taraması (2020-2026, bu projeye özel)
+
+Bu ek tarama, özellikle bu projenin şu anki eksenine göre yapıldı:
+**2D/3D parçacıklar, GPU broad-phase, uniform grid, LBVH, doğrulama/benchmark
+altyapısı ve RT-core tabanlı yeni yönler**. 2020 sonrası literatürde ana kırılma
+şu: klasik CUDA grid/LBVH hâlâ geçerli, fakat "doğru ve ölçülebilir benchmark"
+ile "donanım hızlandırmalı BVH traversal" artık daha önemli hale gelmiş durumda.
+
+- **Serpa, Y. R. & Rodrigues, M. A. F. — "Broadmark: A Testing Framework for
+  Broad-Phase Collision Detection Algorithms" — Computer Graphics Forum, 2020**
+  ([Eurographics](https://diglib.eg.org/items/3f3ae64f-f946-44b5-bd99-e49c27e8fb34),
+  DOI: [10.1111/cgf.13884](https://doi.org/10.1111/cgf.13884)).
+  Bu çalışma doğrudan yeni bir algoritmadan çok, broad-phase algoritmaları için
+  ortak test/benchmark zemini öneriyor. Bizim proje açısından önemi büyük:
+  parity testi, dağılım çeşitliliği, candidate-pair sayımı, CSV/plot üretimi ve
+  metodların aynı framework içinde karşılaştırılması bu makalenin tavsiye ettiği
+  deneysel disipline denk geliyor. Yani `tests/test_parity.c` ve
+  `scripts/plot_results.py` gibi ekler sadece "yardımcı dosya" değil,
+  literatürle uyumlu metodoloji katkısı.
+
+- **Chitalu, F., Dubach, C. & Komura, T. — "Binary Ostensibly-Implicit Trees
+  for Fast Collision Detection" — Computer Graphics Forum / Eurographics, 2020**
+  ([University of Edinburgh](https://www.research.ed.ac.uk/en/publications/binary-ostensibly-implicit-trees-for-fast-collision-detection),
+  DOI: [10.1111/cgf.13948](https://doi.org/10.1111/cgf.13948)).
+  BVH'yi her frame yeniden kurmanın pratik olabileceğini savunan, bellek yerleşimi
+  ve implicit tree temsiliyle BVH construction maliyetini düşüren modern bir
+  çalışma. Bizim LBVH implementasyonu Karras tarzı explicit node dizileri
+  kullanıyor; bu paper, bir sonraki optimizasyon yönünün "daha fazla collision
+  testi" değil, **tree representation + memory layout** olabileceğini gösteriyor.
+  Özellikle `parent/left/right/aabb` dizilerini daha kompakt ve cache-friendly
+  temsil etmek için referans alınabilir.
+
+- **Belgrod, D. et al. — "Time of Impact Dataset for Continuous Collision
+  Detection and a Scalable Conservative Algorithm" — arXiv 2112.06300,
+  2021-2025 revizyonları**
+  ([arXiv](https://arxiv.org/abs/2112.06300)).
+  CCD odaklı olsa da broad-phase açısından çok önemli bir sonuç söylüyor:
+  modern GPU'da basit sweep/sort tabanlı yaklaşımlar, karmaşık yapılara karşı
+  beklenenden iyi ölçeklenebiliyor; ayrıca doğruluk için analytic ground truth ve
+  çoklu algoritma kıyaslaması şart. Bu projenin static DCD problemine doğrudan
+  CCD eklemek gerekmiyor, ama "CPU brute force referans + parity + farklı
+  dağılımlar" çizgisini güçlendiriyor. Gelecek iş olarak moving-circle CCD
+  eklenirse bu paper ana metodoloji referansı olur.
+
+- **Cao, J. & Wang, M. — "A Fast and Generalized Broad-Phase Collision Detection
+  Method Based on KD-Tree Spatial Subdivision and Sweep-and-Prune" — IEEE Access,
+  2023**
+  ([ResearchGate](https://www.researchgate.net/publication/370614239_A_Fast_and_Generalized_Broad-Phase_Collision_Detection_Method_Based_on_KD-Tree_Spatial_Subdivision_and_Sweep-and-Prune),
+  DOI: [10.1109/ACCESS.2023.3274202](https://doi.org/10.1109/ACCESS.2023.3274202)).
+  KD-tree spatial subdivision + sweep-and-prune hibriti öneriyor; uniform/non-uniform
+  boyutlu objeler ve coherent/non-coherent sahneler için genelleştirme iddiası var.
+  Bu proje açısından çıkarım: uniform grid tek radius aralığında çok iyi; ama
+  radius aralığı genişletilirse veya sahne yoğunluğu çok dengesizleşirse KD/SAP
+  hibriti, hierarchical grid veya LBVH ile kıyaslanacak iyi bir "modern CPU/GPU
+  broad-phase" baseline'ı olabilir.
+
+- **Sung, M. — "Visibility-Based Fast Collision Detection of a Large Number of
+  Moving Objects on GPU" — IEEE Access, 2023**
+  ([ResearchGate](https://www.researchgate.net/publication/370854985_Visibility-Based_Fast_Collision_Detection_of_a_large_number_of_Moving_Objects_on_GPU),
+  DOI: [10.1109/ACCESS.2023.3277198](https://doi.org/10.1109/ACCESS.2023.3277198)).
+  LBVH construction maliyetini azaltmak için visibility-based culling ve
+  variable-size Morton code öneriyor. Bu bizim için çok somut bir ders verdi:
+  Morton kodu sadece "detay" değil, LBVH kalitesini ve traversal maliyetini
+  belirleyen kritik parça. Nitekim projede 2D Morton interleave hatası düzeltilince
+  LBVH süresi saniyelerden milisaniyelere indi. İleri optimizasyon olarak
+  16/32/64-bit Morton varyantları ve görünür/aktif obje filtresi denenebilir.
+
+- **Mandarapu, D. K., James, N. & Kulkarni, M. — "Mochi: Fast & Exact Collision
+  Detection" — arXiv 2402.14801, 2024/2025**
+  ([arXiv](https://arxiv.org/abs/2402.14801)).
+  RT-core'ları collision detection için kullanıyor; broad ve narrow phase'i
+  ray tracing donanımına indirgemeye çalışıyor. Spherical particles, implicit
+  mathematical objects ve triangle meshes için farklı reductions veriyor. Bu
+  projenin daire/küre collision problemine en yakın modern yönlerden biri:
+  CUDA kernel tabanlı LBVH yerine OptiX/RT-core BVH traversal kullanmak, özellikle
+  RTX donanımda "future work" olarak çok güçlü bir başlık.
+
+- **Sui, S., Sentis, L. & Bylard, A. — "Hardware-Accelerated Ray Tracing for
+  Discrete and Continuous Collision Detection on GPUs" — arXiv 2409.09918 /
+  ICRA 2025**
+  ([arXiv](https://arxiv.org/abs/2409.09918),
+  DOI: [10.1109/ICRA55743.2025.11128528](https://doi.org/10.1109/ICRA55743.2025.11128528)).
+  Robot mesh/obstacle mesh collision ve swept sphere continuous collision için
+  RT-core tabanlı yöntemler öneriyor. Bu çalışma parçacık broad-phase'den biraz
+  daha robotik/mesh tarafında, ama "çok sayıda query + büyük triangle mesh +
+  batched GPU ray tracing" fikri raporda modern donanım bölümünü güçlendirir.
+  Bizim visualizer/benchmark için doğrudan uygulanacak ilk adım değil; OptiX
+  tabanlı bir ayrı deneysel branch için referans.
+
+- **Mandarapu, D. K. et al. — "Rethinking Collision Detection on GPU Ray Tracing
+  Architecture" — arXiv 2604.23520, 2026**
+  ([arXiv](https://arxiv.org/abs/2604.23520)).
+  Mochi çizgisini özellikle spherical particles ve non-uniform radius problemi
+  üzerinde daha da netleştiriyor. Önceki RT tabanlı fixed-radius neighbor-search
+  indirgemelerinin, farklı yarıçaplarda büyük bounding box ve duplicate collision
+  ürettiğini söylüyor; proxy sphere fikriyle daha sıkı BVH bounding volume'ları
+  hedefliyor. Bu proje ileride `min_radius/max_radius` aralığını genişletirse,
+  "non-uniform radius collision" için en güncel future-work referansı bu olur.
+
+**Bu ek taramanın proje kararına etkisi:**
+
+1. Mevcut CUDA uniform grid hâlâ doğru baseline; özellikle dar radius aralığı ve
+   sabit scene bounds için en güçlü pratik çözüm.
+2. CUDA LBVH eklemek rapor değerini artırır, ama asıl modern katkı onu doğru
+   test etmek ve Morton/layout etkisini göstermek.
+3. 2020 sonrası literatür, "tek hızlı sonuç"tan çok **benchmark güvenilirliği**
+   istiyor: parity, farklı dağılımlar, candidate count, total/kernel time ayrımı,
+   plot ve mümkünse üçüncü parti baseline.
+4. 2024-2026 yönü açıkça RT-core/OptiX tarafına kayıyor. Bu projede bunu
+   implement etmek zorunlu değil, ama final raporda future work olarak en güncel
+   ve güçlü eksen bu.
+
+### E. Yardımcı / arka plan
 
 - **Karras, T. & Aila, T. — "Fast Parallel Construction of High-Quality BVHs" — HPG 2013**
   ([PDF](https://research.nvidia.com/sites/default/files/pubs/2013-07_Fast-Parallel-Construction/karras2013hpg_paper.pdf)).
@@ -492,6 +604,16 @@ Modern (2024-2026):
 - [Mochi: GPU Ray Tracing CD — arXiv 2402.14801](https://arxiv.org/abs/2402.14801)
 - [Hardware-Accelerated RT for CD — arXiv 2409.09918](https://arxiv.org/abs/2409.09918)
 - [Rethinking CD on RT Architecture — arXiv 2604.23520](https://arxiv.org/html/2604.23520v1)
+
+Ek modern tarama (2020-2026):
+- [Broadmark — Broad-Phase Collision Detection Benchmark Framework, CGF 2020](https://diglib.eg.org/items/3f3ae64f-f946-44b5-bd99-e49c27e8fb34)
+- [Binary Ostensibly-Implicit Trees for Fast Collision Detection, CGF/Eurographics 2020](https://www.research.ed.ac.uk/en/publications/binary-ostensibly-implicit-trees-for-fast-collision-detection)
+- [Time of Impact Dataset for CCD and a Scalable Conservative Algorithm — arXiv 2112.06300](https://arxiv.org/abs/2112.06300)
+- [KD-Tree Spatial Subdivision + Sweep-and-Prune Broad-Phase, IEEE Access 2023](https://doi.org/10.1109/ACCESS.2023.3274202)
+- [Visibility-Based Fast Collision Detection on GPU, IEEE Access 2023](https://doi.org/10.1109/ACCESS.2023.3277198)
+- [Mochi: Fast & Exact Collision Detection — arXiv 2402.14801](https://arxiv.org/abs/2402.14801)
+- [Hardware-Accelerated Ray Tracing for DCD/CCD on GPUs — arXiv 2409.09918 / ICRA 2025](https://arxiv.org/abs/2409.09918)
+- [Rethinking Collision Detection on GPU Ray Tracing Architecture — arXiv 2604.23520](https://arxiv.org/abs/2604.23520)
 
 Açık kaynak referans implementasyonlar:
 - [ToruNiina/lbvh](https://github.com/ToruNiina/lbvh)

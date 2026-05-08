@@ -1,9 +1,10 @@
 # CUDA Broad-Phase Collision Detection
 
-CPU baseline, CUDA brute force ve CUDA uniform-grid yöntemleri için 2B daire çarpışma benchmark'ı + canlı raylib görselleştiricisi. Tek bir CMake çağrısıyla iki binary üretir:
+CPU baseline, CUDA brute force, CUDA uniform-grid ve CUDA LBVH yöntemleri için 2B daire çarpışma benchmark'ı + canlı raylib görselleştiricisi. Tek bir CMake çağrısıyla binary'ler üretir:
 
 - `collision_benchmark` — CSV çıkaran benchmark (`results/timings.csv`).
 - `raylib_cuda_visualizer` — CUDA-OpenGL interop ile canlı simülasyon.
+- `collision_parity_test` — CPU/CUDA brute force/grid/LBVH collision count eşitliğini kontrol eden parity testi.
 
 ## Gereksinimler
 
@@ -101,6 +102,20 @@ build\visualization\raylib-cuda-interop\Release\raylib_cuda_visualizer.exe
 ```
 
 `2500` görselleştiricinin simüle edeceği daire sayısı. Benchmark `results/timings.csv` dosyasını çalıştırıldığı dizine yazar.
+
+Doğrulama testi:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Benchmark CSV'sinden grafik üretmek için Python + matplotlib kuruluysa:
+
+```powershell
+python scripts\plot_results.py
+```
+
+Grafikler varsayılan olarak `results/plots/` altına yazılır.
 
 Preset'i değiştirip yeniden build alacaksan önce `build/` klasörünü sil:
 
