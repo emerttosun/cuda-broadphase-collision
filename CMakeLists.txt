@@ -41,6 +41,7 @@ add_library(cmp674_core STATIC
     src/CpuCollision.c
     src/CudaBruteForce.cu
     src/CudaGrid.cu
+    src/CudaHash.cu
     src/CudaLbvh.cu
 )
 target_include_directories(cmp674_core PUBLIC include)

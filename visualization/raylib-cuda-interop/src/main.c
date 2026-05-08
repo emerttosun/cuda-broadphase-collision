@@ -161,7 +161,7 @@ static void draw_particles(unsigned int vao, unsigned int shader_program, int ob
 static const int kCountStep = 500;
 static const int kCountMin = 100;
 static const int kCountMax = 20000;
-static const int kVisualizerModeCount = 5;
+static const int kVisualizerModeCount = 6;
 
 static const char* visualizer_radius_profile_name(RadiusProfile profile) {
     return radius_profile_name(profile);
@@ -173,6 +173,7 @@ static const char* mode_name(int mode) {
         case VISUALIZER_MODE_CPU_BRUTE_FORCE:   return "cpu_brute_force";
         case VISUALIZER_MODE_CUDA_LBVH:         return "cuda_lbvh";
         case VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D: return "cuda_uniform_grid_3d";
+        case VISUALIZER_MODE_CUDA_HASH:         return "cuda_hash";
         default:                                return "cuda_brute_force";
     }
 }

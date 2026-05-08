@@ -2,6 +2,7 @@
 #include "CpuCollision.h"
 #include "CudaBruteForce.cuh"
 #include "CudaGrid.cuh"
+#include "CudaHash.cuh"
 #include "CudaLbvh.cuh"
 #include "DataGenerator.h"
 
@@ -53,6 +54,13 @@ static int run_case(const char* case_name, const Circle* circles, size_t count, 
     lbvh_params.scene_width = config->scene_width;
     lbvh_params.scene_height = config->scene_height;
 
+    CudaHashParams hash_params;
+    hash_params.min_radius = radius_profile_min_radius(config->active_radius_profile);
+    hash_params.max_radius = radius_profile_max_radius(config->active_radius_profile);
+    hash_params.num_levels = 0;
+    hash_params.hash_table_size = 0;
+    hash_params.dense_cell_threshold = config->dense_cell_threshold;
+
     const CollisionResult cpu = run_cpu_brute_force(circles, count, NULL);
     int ok = 1;
     ok = check_method(case_name, "cpu_brute_force", cpu.collision_count, cpu) && ok;
@@ -62,6 +70,8 @@ static int run_case(const char* case_name, const Circle* circles, size_t count, 
                       run_cuda_uniform_grid(circles, count, &grid_params)) && ok;
     ok = check_method(case_name, "cuda_lbvh", cpu.collision_count,
                       run_cuda_lbvh(circles, count, &lbvh_params)) && ok;
+    ok = check_method(case_name, "cuda_hash", cpu.collision_count,
+                      run_cuda_hash(circles, count, &hash_params)) && ok;
     return ok;
 }
 

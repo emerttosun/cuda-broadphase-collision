@@ -3,6 +3,7 @@
 #include "CpuCollision.h"
 #include "CudaBruteForce.cuh"
 #include "CudaGrid.cuh"
+#include "CudaHash.cuh"
 #include "CudaLbvh.cuh"
 #include "DataGenerator.h"
 
@@ -16,7 +17,7 @@
 #include <direct.h>
 #endif
 
-#define MAX_METHODS_PER_DISTRIBUTION (3 + MAX_GRID_CELL_SIZES)
+#define MAX_METHODS_PER_DISTRIBUTION (4 + MAX_GRID_CELL_SIZES)
 
 static int ensure_results_directory(void) {
 #ifdef _WIN32
@@ -70,6 +71,7 @@ static int build_methods(
     BroadphaseMethod* methods,
     CudaGridParams* grid_params_storage,
     CudaLbvhParams* lbvh_params_storage,
+    CudaHashParams* hash_params_storage,
     int max_methods) {
     int n = 0;
     if (n >= max_methods) {
@@ -113,6 +115,20 @@ static int build_methods(
     methods[n].run = run_cuda_lbvh;
     methods[n].params = lbvh_params_storage;
     methods[n].reported_grid_cell_size = 0.0f;
+    n++;
+
+    if (n >= max_methods) {
+        return n;
+    }
+    hash_params_storage->min_radius = radius_profile_min_radius(config->active_radius_profile);
+    hash_params_storage->max_radius = radius_profile_max_radius(config->active_radius_profile);
+    hash_params_storage->num_levels = 0;          /* auto */
+    hash_params_storage->hash_table_size = 0;     /* auto */
+    hash_params_storage->dense_cell_threshold = config->dense_cell_threshold;
+    methods[n].name = "cuda_hash";
+    methods[n].run = run_cuda_hash;
+    methods[n].params = hash_params_storage;
+    methods[n].reported_grid_cell_size = 2.0f * hash_params_storage->min_radius;
     n++;
 
     return n;
@@ -260,11 +276,13 @@ int run_benchmarks(const BenchmarkConfig* config) {
             BroadphaseMethod methods[MAX_METHODS_PER_DISTRIBUTION];
             CudaGridParams grid_params_storage[MAX_GRID_CELL_SIZES];
             CudaLbvhParams lbvh_params_storage;
+            CudaHashParams hash_params_storage;
             const int method_count = build_methods(
                 &case_config,
                 methods,
                 grid_params_storage,
                 &lbvh_params_storage,
+                &hash_params_storage,
                 MAX_METHODS_PER_DISTRIBUTION);
 
             Circle* uniform = generate_uniform_circles(object_count, &case_config);

@@ -65,6 +65,15 @@ static int* g_lbvh_parent = NULL;
 static int* g_lbvh_left = NULL;
 static int* g_lbvh_right = NULL;
 static int* g_lbvh_flags = NULL;
+/* Hierarchical Spatial Hashing (HSH) persistent device buffers. */
+static int* g_hash_composite_keys = NULL;
+static int* g_hash_indices = NULL;
+static int* g_hash_cell_start = NULL;
+static int* g_hash_cell_end = NULL;
+static int g_hash_table_M = 0;
+static int g_hash_total_buckets = 0;
+static int g_hash_num_levels = 0;
+static float g_hash_base_cell_size = 0.0f;
 static cudaGraphicsResource* g_vbo_resource = NULL;
 static cudaEvent_t g_start_event = NULL;
 static cudaEvent_t g_stop_event = NULL;
@@ -922,6 +931,163 @@ __global__ static void lbvh_traverse_kernel(
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Hierarchical Spatial Hashing (HSH) — 3D variant                    */
+/*                                                                     */
+/*  Algorithm matches src/CudaHash.cu (benchmark module) extended to   */
+/*  three dimensions with collision-response writes that match the     */
+/*  visualizer's existing per-method dispatch contract.                */
+/*  References: Teschner et al. 2003 (hash); Eitz/Lixu 2007 (levels).  */
+/* ------------------------------------------------------------------ */
+
+#define VIS_HASH_PRIME_X 73856093u
+#define VIS_HASH_PRIME_Y 19349663u
+#define VIS_HASH_PRIME_Z 83492791u
+#define VIS_HASH_MAX_LEVELS 8
+
+__device__ static inline unsigned int hash_bucket_3d(int cx, int cy, int cz, unsigned int table_M) {
+    const unsigned int h = ((unsigned int)cx) * VIS_HASH_PRIME_X
+                         ^ ((unsigned int)cy) * VIS_HASH_PRIME_Y
+                         ^ ((unsigned int)cz) * VIS_HASH_PRIME_Z;
+    return h % table_M;
+}
+
+__device__ static inline int hash_select_level_d(
+    float radius,
+    float base_cell_size,
+    int max_level_inclusive) {
+    const float diameter = 2.0f * radius;
+    if (diameter <= base_cell_size) {
+        return 0;
+    }
+    int L = (int)ceilf(log2f(diameter / base_cell_size));
+    if (L < 0) L = 0;
+    if (L > max_level_inclusive) L = max_level_inclusive;
+    return L;
+}
+
+__global__ static void hash_assign_3d_kernel(
+    const DeviceBall* balls,
+    int count,
+    float base_cell_size,
+    int num_levels,
+    unsigned int table_M,
+    int* composite_keys,
+    int* indices) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+
+    const DeviceBall b = balls[i];
+    const int L = hash_select_level_d(b.radius, base_cell_size, num_levels - 1);
+    const float cs_L = base_cell_size * (float)(1 << L);
+    const float inv = 1.0f / cs_L;
+    const int cx = (int)floorf(b.x * inv);
+    const int cy = (int)floorf(b.y * inv);
+    const int cz = (int)floorf(b.z * inv);
+    const unsigned int bucket = hash_bucket_3d(cx, cy, cz, table_M);
+    composite_keys[i] = (int)((unsigned int)L * table_M + bucket);
+    indices[i] = i;
+}
+
+/**
+ * @brief 3D HSH query + collision-response kernel.
+ *
+ * One thread per ball. Walks the ball's storage level upward, scanning
+ * a 3x3x3 cell neighbourhood per level around the ball's own cell
+ * (justified by the level invariant @c 2*r <= cs(L); see CudaHash.cu).
+ * Counts each unordered pair exactly once via the same self-level
+ * @c j > i filter as the benchmark module; cross-level pairs are
+ * naturally counted once because the larger object's level is queried
+ * upward only.
+ */
+__global__ static void hash_collide_3d_kernel(
+    DeviceBall* balls,
+    const int* sorted_indices,
+    const int* cell_start,
+    const int* cell_end,
+    int count,
+    float base_cell_size,
+    int num_levels,
+    unsigned int table_M,
+    float* delta_vx,
+    float* delta_vy,
+    float* delta_vz,
+    float* delta_x,
+    float* delta_y,
+    float* delta_z,
+    unsigned long long* collision_count,
+    unsigned long long* candidate_pair_count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+
+    const DeviceBall self = balls[i];
+    const int L_self = hash_select_level_d(self.radius, base_cell_size, num_levels - 1);
+
+    unsigned long long local_collisions = 0;
+    unsigned long long local_candidates = 0;
+
+    for (int L_q = L_self; L_q < num_levels; ++L_q) {
+        const float cs_q = base_cell_size * (float)(1 << L_q);
+        const float inv = 1.0f / cs_q;
+        const int self_cx = (int)floorf(self.x * inv);
+        const int self_cy = (int)floorf(self.y * inv);
+        const int self_cz = (int)floorf(self.z * inv);
+
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int cx = self_cx + dx;
+                    const int cy = self_cy + dy;
+                    const int cz = self_cz + dz;
+                    const unsigned int bucket = hash_bucket_3d(cx, cy, cz, table_M);
+                    const int composite = (int)((unsigned int)L_q * table_M + bucket);
+                    const int start = cell_start[composite];
+                    const int end = cell_end[composite];
+                    if (start < 0 || end < 0) {
+                        continue;
+                    }
+
+                    for (int p = start; p < end; ++p) {
+                        const int j = sorted_indices[p];
+                        const DeviceBall other = balls[j];
+                        const int other_cx = (int)floorf(other.x * inv);
+                        const int other_cy = (int)floorf(other.y * inv);
+                        const int other_cz = (int)floorf(other.z * inv);
+                        if (other_cx != cx || other_cy != cy || other_cz != cz) {
+                            continue;
+                        }
+                        if (L_q == L_self && j <= i) {
+                            continue;
+                        }
+
+                        ++local_candidates;
+                        if (balls_overlap_3d(&self, &other)) {
+                            balls[i].colliding = 1;
+                            balls[j].colliding = 1;
+                            accumulate_collision_response(
+                                balls, i, j,
+                                delta_vx, delta_vy, delta_vz,
+                                delta_x, delta_y, delta_z);
+                            ++local_collisions;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (local_candidates > 0) {
+        atomicAdd(candidate_pair_count, local_candidates);
+    }
+    if (local_collisions > 0) {
+        atomicAdd(collision_count, local_collisions);
+    }
+}
+
 __global__ static void write_vbo_kernel(
     const DeviceBall* balls,
     RenderVertex* vertices,
@@ -1345,6 +1511,78 @@ static void run_lbvh(int blocks, int threads) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+static void run_hash(int blocks, int threads) {
+    const int bucket_blocks = (g_hash_total_buckets + threads - 1) / threads;
+
+    init_cell_ranges_kernel<<<bucket_blocks, threads>>>(
+        g_hash_cell_start, g_hash_cell_end, g_hash_total_buckets);
+    CUDA_CHECK(cudaGetLastError());
+
+    hash_assign_3d_kernel<<<blocks, threads>>>(
+        g_balls,
+        g_object_count,
+        g_hash_base_cell_size,
+        g_hash_num_levels,
+        (unsigned int)g_hash_table_M,
+        g_hash_composite_keys,
+        g_hash_indices);
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::device_ptr<int> keys_ptr(g_hash_composite_keys);
+    thrust::device_ptr<int> indices_ptr(g_hash_indices);
+    thrust::sort_by_key(keys_ptr, keys_ptr + g_object_count, indices_ptr);
+
+    build_cell_ranges_kernel<<<blocks, threads>>>(
+        g_hash_composite_keys, g_hash_cell_start, g_hash_cell_end, g_object_count);
+    CUDA_CHECK(cudaGetLastError());
+
+    hash_collide_3d_kernel<<<blocks, threads>>>(
+        g_balls,
+        g_hash_indices,
+        g_hash_cell_start,
+        g_hash_cell_end,
+        g_object_count,
+        g_hash_base_cell_size,
+        g_hash_num_levels,
+        (unsigned int)g_hash_table_M,
+        g_collision_delta_vx, g_collision_delta_vy, g_collision_delta_vz,
+        g_collision_delta_x, g_collision_delta_y, g_collision_delta_z,
+        g_collision_count, g_candidate_pair_count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Pick HSH base cell size and level count from the active radius
+ *        profile. Called from create() and from reset() so toggling the
+ *        @c V key (radius profile) keeps the level partitioning in sync
+ *        with the data without reallocating buffers.
+ */
+static void hash_configure_from_profile(RadiusProfile profile) {
+    const float min_r = radius_profile_min_radius(profile);
+    const float max_r = radius_profile_max_radius(profile);
+    g_hash_base_cell_size = 2.0f * min_r;
+    int L = (int)ceilf(log2f(max_r / min_r)) + 1;
+    if (L < 1) L = 1;
+    if (L > VIS_HASH_MAX_LEVELS) L = VIS_HASH_MAX_LEVELS;
+    g_hash_num_levels = L;
+}
+
+/**
+ * @brief Smallest prime >= @c lower_bound. Trial division (host).
+ */
+static unsigned int hash_next_prime_host(unsigned int lower_bound) {
+    if (lower_bound <= 2u) return 2u;
+    unsigned int n = (lower_bound % 2u == 0u) ? (lower_bound + 1u) : lower_bound;
+    while (1) {
+        int composite = 0;
+        for (unsigned int d = 3u; d * d <= n; d += 2u) {
+            if ((n % d) == 0u) { composite = 1; break; }
+        }
+        if (!composite) return n;
+        n += 2u;
+    }
+}
+
 extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int width, int height) {
     g_object_count = object_count;
     g_width = width;
@@ -1384,6 +1622,20 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_left, lbvh_nodes * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_right, lbvh_nodes * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_flags, lbvh_nodes * sizeof(int)));
+
+    /* HSH: hash table sized for the visualizer's worst-case (max levels +
+     * next_prime(2N+1)) so toggling radius profiles never requires
+     * reallocation. Configure base/levels from the initial profile. */
+    {
+        const unsigned int target = (unsigned int)(2u * (unsigned int)object_count + 1u);
+        g_hash_table_M = (int)hash_next_prime_host(target < 31u ? 31u : target);
+        g_hash_total_buckets = VIS_HASH_MAX_LEVELS * g_hash_table_M;
+        CUDA_CHECK(cudaMalloc((void**)&g_hash_composite_keys, (size_t)object_count * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&g_hash_indices, (size_t)object_count * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&g_hash_cell_start, (size_t)g_hash_total_buckets * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&g_hash_cell_end, (size_t)g_hash_total_buckets * sizeof(int)));
+        hash_configure_from_profile(RADIUS_PROFILE_NARROW);
+    }
 
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&g_vbo_resource, vbo, cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaEventCreate(&g_start_event));
@@ -1493,6 +1745,26 @@ extern "C" void cuda_visualizer_destroy(void) {
         CUDA_CHECK(cudaFree(g_lbvh_flags));
         g_lbvh_flags = NULL;
     }
+    if (g_hash_composite_keys != NULL) {
+        CUDA_CHECK(cudaFree(g_hash_composite_keys));
+        g_hash_composite_keys = NULL;
+    }
+    if (g_hash_indices != NULL) {
+        CUDA_CHECK(cudaFree(g_hash_indices));
+        g_hash_indices = NULL;
+    }
+    if (g_hash_cell_start != NULL) {
+        CUDA_CHECK(cudaFree(g_hash_cell_start));
+        g_hash_cell_start = NULL;
+    }
+    if (g_hash_cell_end != NULL) {
+        CUDA_CHECK(cudaFree(g_hash_cell_end));
+        g_hash_cell_end = NULL;
+    }
+    g_hash_table_M = 0;
+    g_hash_total_buckets = 0;
+    g_hash_num_levels = 0;
+    g_hash_base_cell_size = 0.0f;
     if (g_start_event != NULL) {
         CUDA_CHECK(cudaEventDestroy(g_start_event));
         g_start_event = NULL;
@@ -1508,6 +1780,7 @@ extern "C" int cuda_visualizer_reset(int clustered, RadiusProfile radius_profile
         return 0;
     }
     g_radius_profile = radius_profile;
+    hash_configure_from_profile(radius_profile);
 
     DeviceBall* h_balls = (DeviceBall*)malloc((size_t)g_object_count * sizeof(DeviceBall));
     if (h_balls == NULL) {
@@ -1524,7 +1797,8 @@ extern "C" int cuda_visualizer_set_mode(int mode) {
         && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID
         && mode != VISUALIZER_MODE_CPU_BRUTE_FORCE
         && mode != VISUALIZER_MODE_CUDA_LBVH
-        && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D) {
+        && mode != VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D
+        && mode != VISUALIZER_MODE_CUDA_HASH) {
         return 0;
     }
     g_mode = mode;
@@ -1607,6 +1881,8 @@ extern "C" int cuda_visualizer_step(
         run_uniform_grid_3d(blocks, threads);
     } else if (g_mode == VISUALIZER_MODE_CUDA_LBVH) {
         run_lbvh(blocks, threads);
+    } else if (g_mode == VISUALIZER_MODE_CUDA_HASH) {
+        run_hash(blocks, threads);
     } else {
         run_brute_force(blocks, threads);
     }

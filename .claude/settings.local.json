@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --preset default)",
+      "PowerShell(Get-Command cmake -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command nvcc -ErrorAction SilentlyContinue)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\CMake\\\\bin;C:\\\\Program Files\\\\NVIDIA GPU Computing Toolkit\\\\CUDA\\\\v13.2\\\\bin;$env:Path\"; cmake -S . -B build_hsh_check -G \"Visual Studio 17 2022\" -A x64 -T \"cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2\" -DCMAKE_CUDA_COMPILER=\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2/bin/nvcc.exe\" -DBUILD_VISUALIZER=OFF -DCMP674_CUDA_ARCHITECTURES=75 2>&1 | Select-Object -Last 50)"
+    ]
+  }
+}
