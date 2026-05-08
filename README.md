@@ -1,6 +1,6 @@
 # CUDA Broad-Phase Collision Detection
 
-CPU baseline, CUDA brute force, CUDA uniform-grid ve CUDA LBVH yöntemleri için 2B daire çarpışma benchmark'ı + canlı raylib görselleştiricisi. Tek bir CMake çağrısıyla binary'ler üretir:
+CPU baseline, CUDA brute force, CUDA uniform-grid ve CUDA LBVH yöntemleri için 2B daire çarpışma benchmark'ı + canlı raylib görselleştiricisi. Benchmark ve görselleştirici aynı radius profillerini (`narrow`, `mixed`, `extreme`) kullanır. Tek bir CMake çağrısıyla binary'ler üretir:
 
 - `collision_benchmark` — CSV çıkaran benchmark (`results/timings.csv`).
 - `raylib_cuda_visualizer` — CUDA-OpenGL interop ile canlı simülasyon.
@@ -117,6 +117,14 @@ python scripts\plot_results.py
 
 Grafikler varsayılan olarak `results/plots/` altına yazılır.
 
+Benchmark CSV'sinde `radius_profile` kolonu bulunur. Varsayılan profiller:
+
+| Profil | Radius sampling |
+| ------ | --------------- |
+| `narrow` | Linear `2..5` |
+| `mixed` | Log-uniform `2..16` |
+| `extreme` | Log-uniform `2..32` |
+
 Preset'i değiştirip yeniden build alacaksan önce `build/` klasörünü sil:
 
 ```powershell
@@ -134,6 +142,7 @@ cmake --build --preset benchmark-only
 
 - `Space` — pause / resume
 - `C` — uniform / clustered dağılım
+- `V` — narrow / mixed / extreme radius profili
 - `G` — mod değiştir (CUDA brute force → CUDA uniform grid → CPU brute force → CUDA LBVH)
 - `+` / `-` — obje sayısını ±500 değiştir (sınırlar: 100..20000)
 - `R` — reset

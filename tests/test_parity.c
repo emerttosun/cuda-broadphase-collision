@@ -46,7 +46,7 @@ static int run_case(const char* case_name, const Circle* circles, size_t count, 
     grid_params.scene_width = config->scene_width;
     grid_params.scene_height = config->scene_height;
     grid_params.cell_size = 10.0f;
-    grid_params.max_radius = config->max_radius;
+    grid_params.max_radius = radius_profile_max_radius(config->active_radius_profile);
     grid_params.dense_cell_threshold = config->dense_cell_threshold;
 
     CudaLbvhParams lbvh_params;
@@ -82,8 +82,6 @@ int main(void) {
     BenchmarkConfig config = {0};
     config.scene_width = 1000.0f;
     config.scene_height = 1000.0f;
-    config.min_radius = 1.0f;
-    config.max_radius = 2.0f;
     config.cluster_count = 4;
     config.cluster_spread = 60.0f;
     config.dense_cell_threshold = 32;
@@ -98,11 +96,29 @@ int main(void) {
     };
 
     int ok = 1;
+    config.active_radius_profile = RADIUS_PROFILE_NARROW;
+    config.min_radius = radius_profile_min_radius(config.active_radius_profile);
+    config.max_radius = radius_profile_max_radius(config.active_radius_profile);
     ok = run_case("tiny_known", tiny, sizeof(tiny) / sizeof(tiny[0]), &config) && ok;
-    ok = run_generated_case("uniform_100", 0, 100u, &config) && ok;
-    ok = run_generated_case("clustered_1000", 1, 1000u, &config) && ok;
-    ok = run_generated_case("uniform_5000", 0, 5000u, &config) && ok;
-    ok = run_generated_case("clustered_5000", 1, 5000u, &config) && ok;
+
+    const RadiusProfile profiles[] = {
+        RADIUS_PROFILE_NARROW,
+        RADIUS_PROFILE_MIXED,
+        RADIUS_PROFILE_EXTREME
+    };
+    for (int i = 0; i < 3; ++i) {
+        config.active_radius_profile = profiles[i];
+        config.min_radius = radius_profile_min_radius(config.active_radius_profile);
+        config.max_radius = radius_profile_max_radius(config.active_radius_profile);
+
+        char uniform_name[64];
+        char clustered_name[64];
+        snprintf(uniform_name, sizeof(uniform_name), "%s_uniform", radius_profile_name(config.active_radius_profile));
+        snprintf(clustered_name, sizeof(clustered_name), "%s_clustered", radius_profile_name(config.active_radius_profile));
+
+        ok = run_generated_case(uniform_name, 0, 1000u, &config) && ok;
+        ok = run_generated_case(clustered_name, 1, 1000u, &config) && ok;
+    }
 
     if (!ok) {
         fprintf(stderr, "Collision parity test failed.\n");

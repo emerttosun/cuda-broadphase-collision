@@ -34,7 +34,7 @@ static int ensure_results_directory(void) {
 static void write_csv_header(FILE* file) {
     fprintf(
         file,
-        "object_count,distribution_type,method_name,collision_count,"
+        "object_count,distribution_type,radius_profile,method_name,collision_count,"
         "candidate_pair_count,kernel_time_ms,total_time_ms,speedup_vs_cpu,grid_cell_size,"
         "max_objects_in_cell,avg_objects_per_non_empty_cell,dense_cell_count\n");
 }
@@ -42,9 +42,10 @@ static void write_csv_header(FILE* file) {
 static void write_csv_result(FILE* file, const BenchmarkResult* row) {
     fprintf(
         file,
-        "%zu,%s,%s,%llu,%llu,%.6f,%.6f,%.6f,%.2f,%d,%.6f,%d\n",
+        "%zu,%s,%s,%s,%llu,%llu,%.6f,%.6f,%.6f,%.2f,%d,%.6f,%d\n",
         row->object_count,
         row->distribution_type,
+        row->radius_profile,
         row->method_name,
         row->collision_count,
         row->candidate_pair_count,
@@ -93,7 +94,7 @@ static int build_methods(
         grid_params_storage[i].scene_width = config->scene_width;
         grid_params_storage[i].scene_height = config->scene_height;
         grid_params_storage[i].cell_size = config->grid_cell_sizes[i];
-        grid_params_storage[i].max_radius = config->max_radius;
+        grid_params_storage[i].max_radius = radius_profile_max_radius(config->active_radius_profile);
         grid_params_storage[i].dense_cell_threshold = config->dense_cell_threshold;
 
         methods[n].name = "cuda_uniform_grid";
@@ -122,6 +123,7 @@ static int run_distribution(
     const BenchmarkConfig* config,
     size_t object_count,
     const char* distribution_name,
+    RadiusProfile radius_profile,
     const Circle* circles,
     const BroadphaseMethod* methods,
     int method_count) {
@@ -129,7 +131,10 @@ static int run_distribution(
         return 0;
     }
 
-    printf("Running %zu objects, %s distribution...\n", object_count, distribution_name);
+    printf("Running %zu objects, %s distribution, %s radius...\n",
+           object_count,
+           distribution_name,
+           radius_profile_name(radius_profile));
 
     double cpu_total_ms = 0.0;
     int cpu_seen = 0;
@@ -141,6 +146,7 @@ static int run_distribution(
         memset(&row, 0, sizeof(row));
         row.object_count = object_count;
         row.distribution_type = distribution_name;
+        row.radius_profile = radius_profile_name(radius_profile);
         row.method_name = methods[m].name;
         row.collision_count = res.collision_count;
         row.candidate_pair_count = res.candidate_pair_count;
@@ -206,10 +212,16 @@ BenchmarkConfig benchmark_default_config(void) {
     config.grid_cell_sizes[3] = 40.0f;
     config.grid_cell_size_len = 4;
 
+    config.radius_profiles[0] = RADIUS_PROFILE_NARROW;
+    config.radius_profiles[1] = RADIUS_PROFILE_MIXED;
+    config.radius_profiles[2] = RADIUS_PROFILE_EXTREME;
+    config.radius_profile_len = 3;
+    config.active_radius_profile = RADIUS_PROFILE_NARROW;
+
     config.scene_width = 1000.0f;
     config.scene_height = 1000.0f;
-    config.min_radius = 1.0f;
-    config.max_radius = 2.0f;
+    config.min_radius = radius_profile_min_radius(config.active_radius_profile);
+    config.max_radius = radius_profile_max_radius(config.active_radius_profile);
     config.cluster_count = 4;
     config.cluster_spread = 60.0f;
     config.dense_cell_threshold = 128;
@@ -236,44 +248,51 @@ int run_benchmarks(const BenchmarkConfig* config) {
 
     write_csv_header(csv);
 
-    BroadphaseMethod methods[MAX_METHODS_PER_DISTRIBUTION];
-    CudaGridParams grid_params_storage[MAX_GRID_CELL_SIZES];
-    CudaLbvhParams lbvh_params_storage;
-    const int method_count = build_methods(
-        config,
-        methods,
-        grid_params_storage,
-        &lbvh_params_storage,
-        MAX_METHODS_PER_DISTRIBUTION);
-
     for (int i = 0; i < config->object_count_len; ++i) {
         const size_t object_count = config->object_counts[i];
 
-        Circle* uniform = generate_uniform_circles(object_count, config);
-        if (uniform == NULL) {
-            fprintf(stderr, "Failed to allocate uniform circles for %zu objects.\n", object_count);
-            fclose(csv);
-            return 0;
-        }
-        if (!run_distribution(csv, config, object_count, "uniform", uniform, methods, method_count)) {
-            free(uniform);
-            fclose(csv);
-            return 0;
-        }
-        free(uniform);
+        for (int r = 0; r < config->radius_profile_len; ++r) {
+            BenchmarkConfig case_config = *config;
+            case_config.active_radius_profile = config->radius_profiles[r];
+            case_config.min_radius = radius_profile_min_radius(case_config.active_radius_profile);
+            case_config.max_radius = radius_profile_max_radius(case_config.active_radius_profile);
 
-        Circle* clustered = generate_clustered_circles(object_count, config);
-        if (clustered == NULL) {
-            fprintf(stderr, "Failed to allocate clustered circles for %zu objects.\n", object_count);
-            fclose(csv);
-            return 0;
-        }
-        if (!run_distribution(csv, config, object_count, "clustered", clustered, methods, method_count)) {
+            BroadphaseMethod methods[MAX_METHODS_PER_DISTRIBUTION];
+            CudaGridParams grid_params_storage[MAX_GRID_CELL_SIZES];
+            CudaLbvhParams lbvh_params_storage;
+            const int method_count = build_methods(
+                &case_config,
+                methods,
+                grid_params_storage,
+                &lbvh_params_storage,
+                MAX_METHODS_PER_DISTRIBUTION);
+
+            Circle* uniform = generate_uniform_circles(object_count, &case_config);
+            if (uniform == NULL) {
+                fprintf(stderr, "Failed to allocate uniform circles for %zu objects.\n", object_count);
+                fclose(csv);
+                return 0;
+            }
+            if (!run_distribution(csv, &case_config, object_count, "uniform", case_config.active_radius_profile, uniform, methods, method_count)) {
+                free(uniform);
+                fclose(csv);
+                return 0;
+            }
+            free(uniform);
+
+            Circle* clustered = generate_clustered_circles(object_count, &case_config);
+            if (clustered == NULL) {
+                fprintf(stderr, "Failed to allocate clustered circles for %zu objects.\n", object_count);
+                fclose(csv);
+                return 0;
+            }
+            if (!run_distribution(csv, &case_config, object_count, "clustered", case_config.active_radius_profile, clustered, methods, method_count)) {
+                free(clustered);
+                fclose(csv);
+                return 0;
+            }
             free(clustered);
-            fclose(csv);
-            return 0;
         }
-        free(clustered);
     }
 
     fclose(csv);

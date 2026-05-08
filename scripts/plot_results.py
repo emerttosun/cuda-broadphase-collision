@@ -45,8 +45,12 @@ def sorted_xy(items: list[dict[str, str]], x_key: str, y_key: str):
 
 def save_line_plot(rows, out_dir: Path, y_key: str, y_label: str, filename: str, log_y: bool = True):
     plt = require_matplotlib()
-    for distribution in sorted({row["distribution_type"] for row in rows}):
-        subset = [row for row in rows if row["distribution_type"] == distribution]
+    has_radius_profile = "radius_profile" in rows[0]
+    plot_keys = ("distribution_type", "radius_profile") if has_radius_profile else ("distribution_type",)
+    for key_values, subset in sorted(group_by(rows, *plot_keys).items()):
+        distribution = key_values[0]
+        radius_profile = key_values[1] if has_radius_profile else None
+        suffix = f"{distribution}_{radius_profile}" if radius_profile is not None else distribution
         plt.figure(figsize=(9, 5))
         for (method,), items in sorted(group_by(subset, "method_name").items()):
             x, y = sorted_xy(items, "object_count", y_key)
@@ -59,7 +63,7 @@ def save_line_plot(rows, out_dir: Path, y_key: str, y_label: str, filename: str,
         plt.grid(True, which="both", alpha=0.25)
         plt.legend()
         plt.tight_layout()
-        plt.savefig(out_dir / f"{distribution}_{filename}", dpi=160)
+        plt.savefig(out_dir / f"{suffix}_{filename}", dpi=160)
         plt.close()
 
 
@@ -71,10 +75,11 @@ def save_grid_histogram(rows, out_dir: Path):
 
     latest_count = max(int(row["object_count"]) for row in grid_rows)
     subset = [row for row in grid_rows if int(row["object_count"]) == latest_count]
-    labels = [
-        f"{row['distribution_type']} cell={float(row['grid_cell_size']):g}"
-        for row in subset
-    ]
+    labels = []
+    for row in subset:
+        radius = row.get("radius_profile")
+        prefix = f"{row['distribution_type']} {radius}" if radius else row["distribution_type"]
+        labels.append(f"{prefix} cell={float(row['grid_cell_size']):g}")
     values = [float(row["max_objects_in_cell"]) for row in subset]
 
     plt.figure(figsize=(10, 5))

@@ -79,6 +79,8 @@ __global__ static void grid_collision_kernel(
     size_t count,
     int grid_width,
     int grid_height,
+    float cell_size,
+    float max_radius,
     unsigned long long* collision_count,
     unsigned long long* candidate_pair_count) {
     const size_t sorted_pos = blockIdx.x * blockDim.x + threadIdx.x;
@@ -94,9 +96,13 @@ __global__ static void grid_collision_kernel(
 
     unsigned long long local_collisions = 0;
     unsigned long long local_candidates = 0;
+    int neighbor_range = (int)ceilf((object.radius + max_radius) / cell_size);
+    if (neighbor_range < 1) {
+        neighbor_range = 1;
+    }
 
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -neighbor_range; dy <= neighbor_range; ++dy) {
+        for (int dx = -neighbor_range; dx <= neighbor_range; ++dx) {
             const int nx = cell_x + dx;
             const int ny = cell_y + dy;
             if (nx < 0 || ny < 0 || nx >= grid_width || ny >= grid_height) {
@@ -189,14 +195,6 @@ extern "C" CollisionResult run_cuda_uniform_grid(const Circle* circles, size_t c
         return result;
     }
 
-    if (p->max_radius > 0.0f && p->cell_size < 2.0f * p->max_radius) {
-        fprintf(stderr,
-                "run_cuda_uniform_grid: cell_size %.3f < 2 * max_radius %.3f; "
-                "8-neighbor search may miss collisions.\n",
-                (double)p->cell_size,
-                (double)p->max_radius);
-    }
-
     const double total_start = timer_now_ms();
 
     const int grid_width = (int)ceilf(p->scene_width / p->cell_size);
@@ -262,6 +260,8 @@ extern "C" CollisionResult run_cuda_uniform_grid(const Circle* circles, size_t c
         count,
         grid_width,
         grid_height,
+        p->cell_size,
+        p->max_radius,
         d_collision_count,
         d_candidate_pair_count);
     CUDA_CHECK(cudaGetLastError());

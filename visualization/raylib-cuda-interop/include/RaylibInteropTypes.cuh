@@ -1,5 +1,7 @@
 #pragma once
 
+#include "RadiusProfile.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,7 +33,7 @@ typedef struct VisualizerMetrics {
 
 int cuda_visualizer_create(unsigned int vbo, int object_count, int width, int height);
 void cuda_visualizer_destroy(void);
-int cuda_visualizer_reset(int clustered);
+int cuda_visualizer_reset(int clustered, RadiusProfile radius_profile);
 int cuda_visualizer_set_mode(int mode);
 int cuda_visualizer_step(float dt, float mouse_x, float mouse_y, int mouse_active, VisualizerMetrics* metrics);
 

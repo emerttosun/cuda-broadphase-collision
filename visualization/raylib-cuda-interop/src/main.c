@@ -132,6 +132,10 @@ static const int kCountStep = 500;
 static const int kCountMin = 100;
 static const int kCountMax = 20000;
 
+static const char* visualizer_radius_profile_name(RadiusProfile profile) {
+    return radius_profile_name(profile);
+}
+
 static const char* mode_name(int mode) {
     switch (mode) {
         case VISUALIZER_MODE_CUDA_UNIFORM_GRID: return "cuda_uniform_grid";
@@ -143,7 +147,7 @@ static const char* mode_name(int mode) {
 }
 
 static int recreate_simulation(unsigned int* vao, unsigned int* vbo,
-                               int new_count, int mode, int clustered) {
+                               int new_count, int mode, int clustered, RadiusProfile radius_profile) {
     cuda_visualizer_destroy();
     rlUnloadVertexBuffer(*vbo);
     rlUnloadVertexArray(*vao);
@@ -152,7 +156,7 @@ static int recreate_simulation(unsigned int* vao, unsigned int* vbo,
         return 0;
     }
     cuda_visualizer_set_mode(mode);
-    cuda_visualizer_reset(clustered);
+    cuda_visualizer_reset(clustered, radius_profile);
     return 1;
 }
 
@@ -186,6 +190,7 @@ int main(int argc, char** argv) {
     int clustered = 0;
     int paused = 0;
     int mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+    RadiusProfile radius_profile = RADIUS_PROFILE_NARROW;
     VisualizerMetrics metrics;
     memset(&metrics, 0, sizeof(metrics));
 
@@ -195,10 +200,17 @@ int main(int argc, char** argv) {
         }
         if (IsKeyPressed(KEY_C)) {
             clustered = !clustered;
-            cuda_visualizer_reset(clustered);
+            cuda_visualizer_reset(clustered, radius_profile);
+            memset(&metrics, 0, sizeof(metrics));
+        }
+        if (IsKeyPressed(KEY_V)) {
+            radius_profile = radius_profile_next(radius_profile);
+            cuda_visualizer_reset(clustered, radius_profile);
+            memset(&metrics, 0, sizeof(metrics));
         }
         if (IsKeyPressed(KEY_R)) {
-            cuda_visualizer_reset(clustered);
+            cuda_visualizer_reset(clustered, radius_profile);
+            memset(&metrics, 0, sizeof(metrics));
         }
         if (IsKeyPressed(KEY_G)) {
             mode = (mode + 1) % 5;
@@ -215,7 +227,7 @@ int main(int argc, char** argv) {
             if (new_count < kCountMin) new_count = kCountMin;
         }
         if (new_count != object_count) {
-            if (recreate_simulation(&vao, &vbo, new_count, mode, clustered)) {
+            if (recreate_simulation(&vao, &vbo, new_count, mode, clustered, radius_profile)) {
                 object_count = new_count;
                 memset(&metrics, 0, sizeof(metrics));
             }
@@ -243,15 +255,16 @@ int main(int argc, char** argv) {
         const char* compute_label =
             (mode == VISUALIZER_MODE_CPU_BRUTE_FORCE) ? "CPU compute" : "CUDA compute";
 
-        DrawRectangle(12, 12, 480, 220, (Color){18, 22, 30, 220});
+        DrawRectangle(12, 12, 480, 244, (Color){18, 22, 30, 220});
         DrawText("Raylib + CUDA-OpenGL Interop 3D", 24, 24, 20, RAYWHITE);
         DrawText(TextFormat("Objects: %d  [+/-]", object_count), 24, 52, 18, LIGHTGRAY);
         DrawText(TextFormat("Distribution: %s  [C]", clustered ? "clustered" : "uniform"), 24, 76, 18, LIGHTGRAY);
-        DrawText(TextFormat("Method: %s  [G]", mode_name(mode)), 24, 100, 18, LIGHTGRAY);
-        DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 124, 18, LIGHTGRAY);
-        DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 148, 18, LIGHTGRAY);
-        DrawText(TextFormat("%s: %.3f ms", compute_label, (double)metrics.gpu_time_ms), 24, 172, 18, LIGHTGRAY);
-        DrawText(TextFormat("FPS: %d", GetFPS()), 24, 196, 18, LIGHTGRAY);
+        DrawText(TextFormat("Radius: %s  [V]", visualizer_radius_profile_name(radius_profile)), 24, 100, 18, LIGHTGRAY);
+        DrawText(TextFormat("Method: %s  [G]", mode_name(mode)), 24, 124, 18, LIGHTGRAY);
+        DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 148, 18, LIGHTGRAY);
+        DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 172, 18, LIGHTGRAY);
+        DrawText(TextFormat("%s: %.3f ms", compute_label, (double)metrics.gpu_time_ms), 24, 196, 18, LIGHTGRAY);
+        DrawText(TextFormat("FPS: %d", GetFPS()), 24, 220, 18, LIGHTGRAY);
 
         EndDrawing();
     }

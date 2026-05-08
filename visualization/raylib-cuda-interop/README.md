@@ -30,6 +30,7 @@ cmake --build build --config Release
 
 - `Space` — pause / resume
 - `C` — uniform / clustered dağılım
+- `V` — narrow / mixed / extreme radius profili
 - `G` — mod değiştir: CUDA brute force → CUDA uniform grid → CPU brute force → CUDA LBVH
 - `+` / `-` — obje sayısını ±500 değiştir (100..20000)
 - `R` — mevcut dağılımı sıfırla

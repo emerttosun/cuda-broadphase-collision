@@ -2,6 +2,7 @@
 #include "Circle.h"
 #include "CollisionMath.h"
 #include "CudaUtils.cuh"
+#include "RadiusProfile.h"
 #include "Rng.h"
 #include "Timer.h"
 
@@ -33,8 +34,6 @@ typedef struct DeviceBall {
 } DeviceBall;
 
 #define VISUALIZER_MAX_CLUSTERS 4
-#define VISUALIZER_BALL_MIN_RADIUS 3.0f
-#define VISUALIZER_BALL_MAX_RADIUS 7.0f
 #define VISUALIZER_GRID_CELL_SIZE 16.0f
 #define VISUALIZER_INIT_SEED 202405u
 #define VISUALIZER_MOUSE_RADIUS 54.0f
@@ -76,6 +75,7 @@ static int g_grid_height = 0;
 static int g_grid_depth = 0;
 static int g_total_cells = 0;
 static int g_mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+static RadiusProfile g_radius_profile = RADIUS_PROFILE_NARROW;
 
 __device__ __host__ static int balls_overlap_3d(const DeviceBall* a, const DeviceBall* b) {
     const float dx = a->x - b->x;
@@ -152,7 +152,7 @@ __device__ __host__ static void project_ball_to_screen(
     const float depth_centered = b->z - depth * 0.5f;
     *screen_x = ((b->x - width * 0.5f) + depth_centered * 0.38f) * perspective + width * 0.5f;
     *screen_y = ((b->y - height * 0.5f) - depth_centered * 0.22f) * perspective + height * 0.5f;
-    *sprite_radius = fmaxf(8.0f, b->radius * 2.2f * perspective);
+    *sprite_radius = b->radius * perspective;
 }
 
 __device__ __host__ static void apply_bounds(DeviceBall* b, int width, int height, float depth) {
@@ -481,6 +481,8 @@ __global__ static void grid_collision_kernel(
     int count,
     int grid_width,
     int grid_height,
+    float cell_size,
+    float max_radius,
     float* delta_vx,
     float* delta_vy,
     float* delta_vz,
@@ -503,9 +505,13 @@ __global__ static void grid_collision_kernel(
 
     unsigned long long local_candidates = 0;
     unsigned long long local_collisions = 0;
+    int neighbor_range = (int)ceilf((self.radius + max_radius) / cell_size);
+    if (neighbor_range < 1) {
+        neighbor_range = 1;
+    }
 
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -neighbor_range; dy <= neighbor_range; ++dy) {
+        for (int dx = -neighbor_range; dx <= neighbor_range; ++dx) {
             const int nx = cell_x + dx;
             const int ny = cell_y + dy;
             if (nx < 0 || ny < 0 || nx >= grid_width || ny >= grid_height) {
@@ -558,6 +564,8 @@ __global__ static void grid_collision_3d_kernel(
     int grid_width,
     int grid_height,
     int grid_depth,
+    float cell_size,
+    float max_radius,
     float* delta_vx,
     float* delta_vy,
     float* delta_vz,
@@ -582,10 +590,14 @@ __global__ static void grid_collision_3d_kernel(
 
     unsigned long long local_candidates = 0;
     unsigned long long local_collisions = 0;
+    int neighbor_range = (int)ceilf((self.radius + max_radius) / cell_size);
+    if (neighbor_range < 1) {
+        neighbor_range = 1;
+    }
 
-    for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
+    for (int dz = -neighbor_range; dz <= neighbor_range; ++dz) {
+        for (int dy = -neighbor_range; dy <= neighbor_range; ++dy) {
+            for (int dx = -neighbor_range; dx <= neighbor_range; ++dx) {
                 const int nx = cell_x + dx;
                 const int ny = cell_y + dy;
                 const int nz = cell_z + dz;
@@ -914,8 +926,12 @@ __global__ static void write_vbo_kernel(
     }
 }
 
-static void host_init_balls(DeviceBall* h_balls, int count, int clustered, unsigned int seed) {
-    unsigned int rng = seed ^ 0x9E3779B9u ^ (unsigned int)count ^ (clustered ? 0xC0FFEEu : 0xBADD00Du);
+static void host_init_balls(DeviceBall* h_balls, int count, int clustered, RadiusProfile radius_profile, unsigned int seed) {
+    unsigned int rng = seed
+        ^ 0x9E3779B9u
+        ^ (unsigned int)count
+        ^ (unsigned int)radius_profile * 0x85EBCA6Bu
+        ^ (clustered ? 0xC0FFEEu : 0xBADD00Du);
 
     float centers_x[VISUALIZER_MAX_CLUSTERS];
     float centers_y[VISUALIZER_MAX_CLUSTERS];
@@ -929,7 +945,7 @@ static void host_init_balls(DeviceBall* h_balls, int count, int clustered, unsig
     }
 
     for (int i = 0; i < count; ++i) {
-        const float radius = rng_range_float(&rng, VISUALIZER_BALL_MIN_RADIUS, VISUALIZER_BALL_MAX_RADIUS);
+        const float radius = sample_radius_for_profile(&rng, radius_profile);
         float x;
         float y;
         float z;
@@ -1157,6 +1173,8 @@ static void run_uniform_grid(int blocks, int threads) {
         g_object_count,
         g_grid_width,
         g_grid_height,
+        VISUALIZER_GRID_CELL_SIZE,
+        radius_profile_max_radius(g_radius_profile),
         g_collision_delta_vx,
         g_collision_delta_vy,
         g_collision_delta_vz,
@@ -1201,6 +1219,8 @@ static void run_uniform_grid_3d(int blocks, int threads) {
         g_grid_width,
         g_grid_height,
         g_grid_depth,
+        VISUALIZER_GRID_CELL_SIZE,
+        radius_profile_max_radius(g_radius_profile),
         g_collision_delta_vx,
         g_collision_delta_vy,
         g_collision_delta_vz,
@@ -1299,7 +1319,7 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     CUDA_CHECK(cudaEventCreate(&g_start_event));
     CUDA_CHECK(cudaEventCreate(&g_stop_event));
 
-    return cuda_visualizer_reset(0);
+    return cuda_visualizer_reset(0, RADIUS_PROFILE_NARROW);
 }
 
 extern "C" void cuda_visualizer_destroy(void) {
@@ -1413,16 +1433,17 @@ extern "C" void cuda_visualizer_destroy(void) {
     }
 }
 
-extern "C" int cuda_visualizer_reset(int clustered) {
+extern "C" int cuda_visualizer_reset(int clustered, RadiusProfile radius_profile) {
     if (g_balls == NULL) {
         return 0;
     }
+    g_radius_profile = radius_profile;
 
     DeviceBall* h_balls = (DeviceBall*)malloc((size_t)g_object_count * sizeof(DeviceBall));
     if (h_balls == NULL) {
         return 0;
     }
-    host_init_balls(h_balls, g_object_count, clustered, VISUALIZER_INIT_SEED);
+    host_init_balls(h_balls, g_object_count, clustered, radius_profile, VISUALIZER_INIT_SEED);
     CUDA_CHECK(cudaMemcpy(g_balls, h_balls, (size_t)g_object_count * sizeof(DeviceBall), cudaMemcpyHostToDevice));
     free(h_balls);
     return 1;

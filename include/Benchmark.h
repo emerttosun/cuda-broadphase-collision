@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GridStats.h"
+#include "RadiusProfile.h"
 
 #include <stddef.h>
 
@@ -10,12 +11,16 @@ extern "C" {
 
 #define MAX_BENCHMARK_OBJECT_COUNTS 5
 #define MAX_GRID_CELL_SIZES 4
+#define MAX_RADIUS_PROFILES 3
 
 typedef struct BenchmarkConfig {
     size_t object_counts[MAX_BENCHMARK_OBJECT_COUNTS];
     int object_count_len;
     float grid_cell_sizes[MAX_GRID_CELL_SIZES];
     int grid_cell_size_len;
+    RadiusProfile radius_profiles[MAX_RADIUS_PROFILES];
+    int radius_profile_len;
+    RadiusProfile active_radius_profile;
     float scene_width;
     float scene_height;
     float min_radius;
@@ -30,6 +35,7 @@ typedef struct BenchmarkConfig {
 typedef struct BenchmarkResult {
     size_t object_count;
     const char* distribution_type;
+    const char* radius_profile;
     const char* method_name;
     unsigned long long collision_count;
     unsigned long long candidate_pair_count;

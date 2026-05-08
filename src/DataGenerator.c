@@ -24,7 +24,7 @@ Circle* generate_uniform_circles(size_t count, const BenchmarkConfig* config) {
     for (size_t i = 0; i < count; ++i) {
         circles[i].x = rng_range_float(&rng, 0.0f, config->scene_width);
         circles[i].y = rng_range_float(&rng, 0.0f, config->scene_height);
-        circles[i].radius = rng_range_float(&rng, config->min_radius, config->max_radius);
+        circles[i].radius = sample_radius_for_profile(&rng, config->active_radius_profile);
     }
 
     return circles;
@@ -56,7 +56,7 @@ Circle* generate_clustered_circles(size_t count, const BenchmarkConfig* config) 
 
         circles[i].x = clamp_float(centers[center_index].x + cosf(angle) * distance, 0.0f, config->scene_width);
         circles[i].y = clamp_float(centers[center_index].y + sinf(angle) * distance, 0.0f, config->scene_height);
-        circles[i].radius = rng_range_float(&rng, config->min_radius, config->max_radius);
+        circles[i].radius = sample_radius_for_profile(&rng, config->active_radius_profile);
     }
 
     return circles;
