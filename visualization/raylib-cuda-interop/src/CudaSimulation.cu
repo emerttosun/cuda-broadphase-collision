@@ -37,7 +37,9 @@ typedef struct DeviceBall {
 #define VISUALIZER_GRID_CELL_SIZE 16.0f
 #define VISUALIZER_INIT_SEED 202405u
 #define VISUALIZER_MOUSE_RADIUS 54.0f
-#define VISUALIZER_MOUSE_PUSH_SPEED 320.0f
+#define VISUALIZER_BALL_MIN_SPEED 20.0f
+#define VISUALIZER_BALL_MAX_SPEED 200.0f
+#define VISUALIZER_COLLISION_SPEED_BOOST 1.04f
 
 static DeviceBall* g_balls = NULL;
 static DeviceBall* g_host_balls = NULL;
@@ -208,6 +210,23 @@ __device__ __host__ static void apply_bounds(DeviceBall* b, int width, int heigh
     }
 }
 
+__device__ __host__ static void clamp_speed_after_collision(DeviceBall* b, float original_speed) {
+    const float speed_sq = b->vx * b->vx + b->vy * b->vy + b->vz * b->vz;
+    if (speed_sq <= 1.0e-6f || original_speed <= 1.0e-6f) {
+        return;
+    }
+
+    float target_speed = original_speed * VISUALIZER_COLLISION_SPEED_BOOST;
+    if (target_speed > VISUALIZER_BALL_MAX_SPEED) {
+        target_speed = VISUALIZER_BALL_MAX_SPEED;
+    }
+
+    const float scale = target_speed / sqrtf(speed_sq);
+    b->vx *= scale;
+    b->vy *= scale;
+    b->vz *= scale;
+}
+
 __device__ static void accumulate_collision_response(
     const DeviceBall* balls,
     int a_index,
@@ -284,6 +303,7 @@ __global__ static void apply_collision_response_kernel(
     }
 
     DeviceBall b = balls[i];
+    const float original_speed = sqrtf(b.vx * b.vx + b.vy * b.vy + b.vz * b.vz);
     b.vx += delta_vx[i];
     b.vy += delta_vy[i];
     b.vz += delta_vz[i];
@@ -315,6 +335,7 @@ __global__ static void apply_collision_response_kernel(
         b.vz = -fabsf(b.vz);
     }
 
+    clamp_speed_after_collision(&b, original_speed);
     balls[i] = b;
 }
 
@@ -350,13 +371,15 @@ __device__ __host__ static void apply_mouse_collision(
     const float ny = dy / distance;
     const float penetration = collider_radius - distance;
     const float correction = penetration * 0.72f + 0.5f;
-    const float outward_speed = b->vx * nx + b->vy * ny;
-    const float impulse = fmaxf(0.0f, VISUALIZER_MOUSE_PUSH_SPEED - outward_speed);
+    const float original_speed = sqrtf(b->vx * b->vx + b->vy * b->vy + b->vz * b->vz);
+    const float tangential_vx = b->vx - (b->vx * nx + b->vy * ny) * nx;
+    const float tangential_vy = b->vy - (b->vx * nx + b->vy * ny) * ny;
 
     b->x += nx * correction;
     b->y += ny * correction;
-    b->vx += nx * impulse;
-    b->vy += ny * impulse;
+    b->vx = tangential_vx + nx * original_speed;
+    b->vy = tangential_vy + ny * original_speed;
+    clamp_speed_after_collision(b, original_speed);
     b->colliding = 1;
     apply_bounds(b, width, height, depth);
 }
@@ -1003,9 +1026,21 @@ static void host_init_balls(DeviceBall* h_balls, int count, int clustered, Radiu
         h_balls[i].x = x;
         h_balls[i].y = y;
         h_balls[i].z = z;
-        h_balls[i].vx = rng_range_float(&rng, -90.0f, 90.0f);
-        h_balls[i].vy = rng_range_float(&rng, -90.0f, 90.0f);
-        h_balls[i].vz = rng_range_float(&rng, -90.0f, 90.0f);
+        float dir_x = rng_range_float(&rng, -1.0f, 1.0f);
+        float dir_y = rng_range_float(&rng, -1.0f, 1.0f);
+        float dir_z = rng_range_float(&rng, -1.0f, 1.0f);
+        float dir_len_sq = dir_x * dir_x + dir_y * dir_y + dir_z * dir_z;
+        if (dir_len_sq < 1.0e-5f) {
+            dir_x = 1.0f;
+            dir_y = 0.0f;
+            dir_z = 0.0f;
+            dir_len_sq = 1.0f;
+        }
+        const float inv_dir_len = 1.0f / sqrtf(dir_len_sq);
+        const float speed = rng_range_float(&rng, VISUALIZER_BALL_MIN_SPEED, VISUALIZER_BALL_MAX_SPEED);
+        h_balls[i].vx = dir_x * inv_dir_len * speed;
+        h_balls[i].vy = dir_y * inv_dir_len * speed;
+        h_balls[i].vz = dir_z * inv_dir_len * speed;
         h_balls[i].radius = radius;
         h_balls[i].colliding = 0;
     }
@@ -1045,6 +1080,8 @@ static void cpu_integrate(DeviceBall* balls, int count, float dt, int width, int
 static void cpu_apply_collision_response(DeviceBall* balls, int a_index, int b_index) {
     DeviceBall* a = &balls[a_index];
     DeviceBall* b = &balls[b_index];
+    const float a_original_speed = sqrtf(a->vx * a->vx + a->vy * a->vy + a->vz * a->vz);
+    const float b_original_speed = sqrtf(b->vx * b->vx + b->vy * b->vy + b->vz * b->vz);
     float nx = b->x - a->x;
     float ny = b->y - a->y;
     float nz = b->z - a->z;
@@ -1088,6 +1125,8 @@ static void cpu_apply_collision_response(DeviceBall* balls, int a_index, int b_i
     b->vx += relative_speed * nx;
     b->vy += relative_speed * ny;
     b->vz += relative_speed * nz;
+    clamp_speed_after_collision(a, a_original_speed);
+    clamp_speed_after_collision(b, b_original_speed);
 }
 
 static void cpu_clamp_to_bounds(DeviceBall* balls, int count, int width, int height, float depth) {
