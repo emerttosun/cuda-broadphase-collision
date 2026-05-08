@@ -144,15 +144,42 @@ __device__ __host__ static void project_ball_to_screen(
     int width,
     int height,
     float depth,
+    const VisualizerCamera* camera,
     float* screen_x,
     float* screen_y,
     float* sprite_radius) {
-    const float camera_distance = 900.0f;
-    const float perspective = camera_distance / (camera_distance + (depth - b->z));
-    const float depth_centered = b->z - depth * 0.5f;
-    *screen_x = ((b->x - width * 0.5f) + depth_centered * 0.38f) * perspective + width * 0.5f;
-    *screen_y = ((b->y - height * 0.5f) - depth_centered * 0.22f) * perspective + height * 0.5f;
-    *sprite_radius = b->radius * perspective;
+    const float cy = cosf(camera->yaw);
+    const float sy = sinf(camera->yaw);
+    const float cp = cosf(camera->pitch);
+    const float sp = sinf(camera->pitch);
+
+    const float forward_x = sy * cp;
+    const float forward_y = sp;
+    const float forward_z = cy * cp;
+    const float right_x = cy;
+    const float right_z = -sy;
+    const float up_x = -sy * sp;
+    const float up_y = cp;
+    const float up_z = -cy * sp;
+
+    const float world_x = b->x - width * 0.5f;
+    const float world_y = height * 0.5f - b->y;
+    const float world_z = b->z - depth * 0.5f;
+    const float rel_x = world_x + forward_x * camera->distance;
+    const float rel_y = world_y + forward_y * camera->distance;
+    const float rel_z = world_z + forward_z * camera->distance;
+
+    const float camera_x = rel_x * right_x + rel_z * right_z;
+    const float camera_y = rel_x * up_x + rel_y * up_y + rel_z * up_z;
+    float camera_z = rel_x * forward_x + rel_y * forward_y + rel_z * forward_z;
+    if (camera_z < 20.0f) {
+        camera_z = 20.0f;
+    }
+
+    const float focal = 760.0f;
+    *screen_x = width * 0.5f + focal * camera_x / camera_z;
+    *screen_y = height * 0.5f - focal * camera_y / camera_z;
+    *sprite_radius = fmaxf(6.0f, b->radius * focal / camera_z);
 }
 
 __device__ __host__ static void apply_bounds(DeviceBall* b, int width, int height, float depth) {
@@ -297,11 +324,12 @@ __device__ __host__ static void apply_mouse_collision(
     float mouse_y,
     int width,
     int height,
-    float depth) {
+    float depth,
+    const VisualizerCamera* camera) {
     float screen_x = 0.0f;
     float screen_y = 0.0f;
     float sprite_radius = 0.0f;
-    project_ball_to_screen(b, width, height, depth, &screen_x, &screen_y, &sprite_radius);
+    project_ball_to_screen(b, width, height, depth, camera, &screen_x, &screen_y, &sprite_radius);
 
     float dx = screen_x - mouse_x;
     float dy = screen_y - mouse_y;
@@ -341,7 +369,8 @@ __global__ static void mouse_collision_kernel(
     int mouse_active,
     int width,
     int height,
-    float depth) {
+    float depth,
+    VisualizerCamera camera) {
     if (!mouse_active) {
         return;
     }
@@ -352,7 +381,7 @@ __global__ static void mouse_collision_kernel(
     }
 
     DeviceBall b = balls[i];
-    apply_mouse_collision(&b, mouse_x, mouse_y, width, height, depth);
+    apply_mouse_collision(&b, mouse_x, mouse_y, width, height, depth, &camera);
     balls[i] = b;
 }
 
@@ -876,7 +905,8 @@ __global__ static void write_vbo_kernel(
     int count,
     int width,
     int height,
-    float depth) {
+    float depth,
+    VisualizerCamera camera) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) {
         return;
@@ -886,7 +916,7 @@ __global__ static void write_vbo_kernel(
     float projected_x = 0.0f;
     float projected_y = 0.0f;
     float sprite_radius = 0.0f;
-    project_ball_to_screen(&b, width, height, depth, &projected_x, &projected_y, &sprite_radius);
+    project_ball_to_screen(&b, width, height, depth, &camera, &projected_x, &projected_y, &sprite_radius);
     const float center_x = (projected_x / (float)width) * 2.0f - 1.0f;
     const float center_y = 1.0f - (projected_y / (float)height) * 2.0f;
     const float radius_x = sprite_radius / (float)width * 2.0f;
@@ -1095,13 +1125,14 @@ static void cpu_apply_mouse_collision(
     int mouse_active,
     int width,
     int height,
-    float depth) {
+    float depth,
+    const VisualizerCamera* camera) {
     if (!mouse_active) {
         return;
     }
 
     for (int i = 0; i < count; ++i) {
-        apply_mouse_collision(&balls[i], mouse_x, mouse_y, width, height, depth);
+        apply_mouse_collision(&balls[i], mouse_x, mouse_y, width, height, depth, camera);
     }
 }
 
@@ -1466,10 +1497,12 @@ extern "C" int cuda_visualizer_step(
     float mouse_x,
     float mouse_y,
     int mouse_active,
+    const VisualizerCamera* camera,
     VisualizerMetrics* metrics) {
-    if (g_balls == NULL || g_vbo_resource == NULL || metrics == NULL) {
+    if (g_balls == NULL || g_vbo_resource == NULL || metrics == NULL || camera == NULL) {
         return 0;
     }
+    const VisualizerCamera camera_value = *camera;
 
     const int threads = 256;
     const int blocks = (g_object_count + threads - 1) / threads;
@@ -1495,7 +1528,8 @@ extern "C" int cuda_visualizer_step(
             mouse_active,
             g_width,
             g_height,
-            g_depth);
+            g_depth,
+            &camera_value);
         const double t1 = timer_now_ms();
 
         CUDA_CHECK(cudaMemcpy(g_balls, g_host_balls,
@@ -1504,7 +1538,8 @@ extern "C" int cuda_visualizer_step(
 
         CUDA_CHECK(cudaGraphicsMapResources(1, &g_vbo_resource, 0));
         CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&vertices, &mapped_size, g_vbo_resource));
-        write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height, g_depth);
+        write_vbo_kernel<<<blocks, threads>>>(
+            g_balls, vertices, g_object_count, g_width, g_height, g_depth, camera_value);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &g_vbo_resource, 0));
 
@@ -1559,12 +1594,14 @@ extern "C" int cuda_visualizer_step(
         mouse_active,
         g_width,
         g_height,
-        g_depth);
+        g_depth,
+        camera_value);
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaGraphicsMapResources(1, &g_vbo_resource, 0));
     CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&vertices, &mapped_size, g_vbo_resource));
-    write_vbo_kernel<<<blocks, threads>>>(g_balls, vertices, g_object_count, g_width, g_height, g_depth);
+    write_vbo_kernel<<<blocks, threads>>>(
+        g_balls, vertices, g_object_count, g_width, g_height, g_depth, camera_value);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaGraphicsUnmapResources(1, &g_vbo_resource, 0));
 

@@ -31,11 +31,23 @@ typedef struct VisualizerMetrics {
     float gpu_time_ms;
 } VisualizerMetrics;
 
+typedef struct VisualizerCamera {
+    float yaw;
+    float pitch;
+    float distance;
+} VisualizerCamera;
+
 int cuda_visualizer_create(unsigned int vbo, int object_count, int width, int height);
 void cuda_visualizer_destroy(void);
 int cuda_visualizer_reset(int clustered, RadiusProfile radius_profile);
 int cuda_visualizer_set_mode(int mode);
-int cuda_visualizer_step(float dt, float mouse_x, float mouse_y, int mouse_active, VisualizerMetrics* metrics);
+int cuda_visualizer_step(
+    float dt,
+    float mouse_x,
+    float mouse_y,
+    int mouse_active,
+    const VisualizerCamera* camera,
+    VisualizerMetrics* metrics);
 
 #ifdef __cplusplus
 }

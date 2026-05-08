@@ -3,6 +3,7 @@
 #include "raylib.h"
 #include "rlgl.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,10 +11,9 @@
 static const int kWindowWidth = 1280;
 static const int kWindowHeight = 720;
 static const float kBoxDepth = 540.0f;
-static const float kProjectionSkewX = 0.38f;
-static const float kProjectionSkewY = 0.22f;
-static const float kCameraDistance = 900.0f;
 static const float kMouseColliderRadius = 54.0f;
+static const float kCameraMinDistance = 90.0f;
+static const float kCameraMaxDistance = 2200.0f;
 
 static const char* kVertexShader =
     "#version 330 core\n"
@@ -66,19 +66,49 @@ static void create_particle_buffers(unsigned int* vao, unsigned int* vbo, int ob
     rlDisableVertexArray();
 }
 
-static Vector2 project_box_point(float x, float y, float z) {
-    const float depth_centered = z - kBoxDepth * 0.5f;
-    const float perspective = kCameraDistance / (kCameraDistance + (kBoxDepth - z));
-    const float screen_x =
-        ((x - kWindowWidth * 0.5f) + depth_centered * kProjectionSkewX) * perspective
-        + kWindowWidth * 0.5f;
-    const float screen_y =
-        ((y - kWindowHeight * 0.5f) - depth_centered * kProjectionSkewY) * perspective
-        + kWindowHeight * 0.5f;
-    return (Vector2){screen_x, screen_y};
+static float clamp_float(float value, float lo, float hi) {
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
 }
 
-static void draw_container_box(int draw_faces) {
+static Vector2 project_box_point(float x, float y, float z, const VisualizerCamera* camera) {
+    const float cy = cosf(camera->yaw);
+    const float sy = sinf(camera->yaw);
+    const float cp = cosf(camera->pitch);
+    const float sp = sinf(camera->pitch);
+
+    const float forward_x = sy * cp;
+    const float forward_y = sp;
+    const float forward_z = cy * cp;
+    const float right_x = cy;
+    const float right_z = -sy;
+    const float up_x = -sy * sp;
+    const float up_y = cp;
+    const float up_z = -cy * sp;
+
+    const float world_x = x - kWindowWidth * 0.5f;
+    const float world_y = kWindowHeight * 0.5f - y;
+    const float world_z = z - kBoxDepth * 0.5f;
+    const float rel_x = world_x + forward_x * camera->distance;
+    const float rel_y = world_y + forward_y * camera->distance;
+    const float rel_z = world_z + forward_z * camera->distance;
+
+    const float camera_x = rel_x * right_x + rel_z * right_z;
+    const float camera_y = rel_x * up_x + rel_y * up_y + rel_z * up_z;
+    float camera_z = rel_x * forward_x + rel_y * forward_y + rel_z * forward_z;
+    if (camera_z < 20.0f) {
+        camera_z = 20.0f;
+    }
+
+    const float focal = 760.0f;
+    return (Vector2){
+        kWindowWidth * 0.5f + focal * camera_x / camera_z,
+        kWindowHeight * 0.5f - focal * camera_y / camera_z
+    };
+}
+
+static void draw_container_box(int draw_faces, const VisualizerCamera* camera) {
     const float left = 0.0f;
     const float right = (float)kWindowWidth;
     const float top = 0.0f;
@@ -88,14 +118,14 @@ static void draw_container_box(int draw_faces) {
     const Color back = (Color){86, 111, 138, 90};
     const Color front = (Color){150, 206, 255, 150};
 
-    Vector2 p000 = project_box_point(left, top, z_far);
-    Vector2 p100 = project_box_point(right, top, z_far);
-    Vector2 p110 = project_box_point(right, bottom, z_far);
-    Vector2 p010 = project_box_point(left, bottom, z_far);
-    Vector2 p001 = project_box_point(left, top, z_near);
-    Vector2 p101 = project_box_point(right, top, z_near);
-    Vector2 p111 = project_box_point(right, bottom, z_near);
-    Vector2 p011 = project_box_point(left, bottom, z_near);
+    Vector2 p000 = project_box_point(left, top, z_far, camera);
+    Vector2 p100 = project_box_point(right, top, z_far, camera);
+    Vector2 p110 = project_box_point(right, bottom, z_far, camera);
+    Vector2 p010 = project_box_point(left, bottom, z_far, camera);
+    Vector2 p001 = project_box_point(left, top, z_near, camera);
+    Vector2 p101 = project_box_point(right, top, z_near, camera);
+    Vector2 p111 = project_box_point(right, bottom, z_near, camera);
+    Vector2 p011 = project_box_point(left, bottom, z_near, camera);
 
     if (draw_faces) {
         DrawTriangle(p000, p100, p110, (Color){32, 56, 78, 26});
@@ -191,10 +221,12 @@ int main(int argc, char** argv) {
     int paused = 0;
     int mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
     RadiusProfile radius_profile = RADIUS_PROFILE_NARROW;
+    VisualizerCamera camera = {0.0f, 0.0f, 900.0f};
     VisualizerMetrics metrics;
     memset(&metrics, 0, sizeof(metrics));
 
     while (!WindowShouldClose()) {
+        const float frame_dt = GetFrameTime();
         if (IsKeyPressed(KEY_SPACE)) {
             paused = !paused;
         }
@@ -216,6 +248,28 @@ int main(int argc, char** argv) {
             mode = (mode + 1) % 5;
             cuda_visualizer_set_mode(mode);
         }
+        if (IsKeyPressed(KEY_F)) {
+            camera.yaw = 0.0f;
+            camera.pitch = 0.0f;
+            camera.distance = 900.0f;
+        }
+
+        const float turn_speed = 1.45f * frame_dt;
+        const float move_speed = 650.0f * frame_dt;
+        if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) camera.yaw -= turn_speed;
+        if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) camera.yaw += turn_speed;
+        if (IsKeyDown(KEY_Q) || IsKeyDown(KEY_UP)) camera.pitch += turn_speed;
+        if (IsKeyDown(KEY_E) || IsKeyDown(KEY_DOWN)) camera.pitch -= turn_speed;
+        if (IsKeyDown(KEY_W)) camera.distance -= move_speed;
+        if (IsKeyDown(KEY_S)) camera.distance += move_speed;
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            const Vector2 delta = GetMouseDelta();
+            camera.yaw += delta.x * 0.006f;
+            camera.pitch -= delta.y * 0.006f;
+        }
+        camera.distance -= GetMouseWheelMove() * 90.0f;
+        camera.pitch = clamp_float(camera.pitch, -1.25f, 1.25f);
+        camera.distance = clamp_float(camera.distance, kCameraMinDistance, kCameraMaxDistance);
 
         int new_count = object_count;
         if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {
@@ -239,14 +293,14 @@ int main(int argc, char** argv) {
             && mouse.y >= 0.0f && mouse.y < (float)kWindowHeight;
 
         if (!paused) {
-            cuda_visualizer_step(GetFrameTime(), mouse.x, mouse.y, mouse_active, &metrics);
+            cuda_visualizer_step(frame_dt, mouse.x, mouse.y, mouse_active, &camera, &metrics);
         }
 
         BeginDrawing();
         ClearBackground((Color){8, 10, 14, 255});
-        draw_container_box(1);
+        draw_container_box(1, &camera);
         draw_particles(vao, particle_shader, object_count);
-        draw_container_box(0);
+        draw_container_box(0, &camera);
         if (mouse_active) {
             DrawCircleLines((int)mouse.x, (int)mouse.y, kMouseColliderRadius, (Color){255, 255, 255, 95});
             DrawCircle((int)mouse.x, (int)mouse.y, 3.0f, (Color){255, 255, 255, 160});
@@ -255,7 +309,7 @@ int main(int argc, char** argv) {
         const char* compute_label =
             (mode == VISUALIZER_MODE_CPU_BRUTE_FORCE) ? "CPU compute" : "CUDA compute";
 
-        DrawRectangle(12, 12, 480, 244, (Color){18, 22, 30, 220});
+        DrawRectangle(12, 12, 520, 268, (Color){18, 22, 30, 220});
         DrawText("Raylib + CUDA-OpenGL Interop 3D", 24, 24, 20, RAYWHITE);
         DrawText(TextFormat("Objects: %d  [+/-]", object_count), 24, 52, 18, LIGHTGRAY);
         DrawText(TextFormat("Distribution: %s  [C]", clustered ? "clustered" : "uniform"), 24, 76, 18, LIGHTGRAY);
@@ -265,6 +319,11 @@ int main(int argc, char** argv) {
         DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 172, 18, LIGHTGRAY);
         DrawText(TextFormat("%s: %.3f ms", compute_label, (double)metrics.gpu_time_ms), 24, 196, 18, LIGHTGRAY);
         DrawText(TextFormat("FPS: %d", GetFPS()), 24, 220, 18, LIGHTGRAY);
+        DrawText(TextFormat("Camera: yaw %.1f pitch %.1f dist %.0f  [RMB/WASD/QE/F]",
+                            (double)(camera.yaw * 57.29578f),
+                            (double)(camera.pitch * 57.29578f),
+                            (double)camera.distance),
+                 24, 244, 18, LIGHTGRAY);
 
         EndDrawing();
     }
