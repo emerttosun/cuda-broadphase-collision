@@ -1,6 +1,4 @@
 #include "RaylibInteropTypes.cuh"
-#include "Circle.h"
-#include "CollisionMath.h"
 #include "CudaUtils.cuh"
 #include "RadiusProfile.h"
 #include "Rng.h"
@@ -15,12 +13,34 @@
 #include <cuda_gl_interop.h>
 #include <cuda_runtime.h>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief Sum @p value across the warp's currently-converged threads and have
+ *        the group leader issue a single ::atomicAdd.
+ *
+ * The broad-phase kernels otherwise hammer two global counters with one
+ * atomic per thread; aggregating per warp first cuts that traffic by up to
+ * 32x. Uses ::cg::coalesced_threads so it stays correct for the partial
+ * warp at the tail of the grid and under independent thread scheduling.
+ */
+__device__ static inline void warp_accumulate_u64(unsigned long long* dst, unsigned long long value) {
+    cg::coalesced_group warp = cg::coalesced_threads();
+    const unsigned long long total = cg::reduce(warp, value, cg::plus<unsigned long long>());
+    if (warp.thread_rank() == 0 && total != 0ull) {
+        atomicAdd(dst, total);
+    }
+}
 
 typedef struct DeviceBall {
     float x;
@@ -55,15 +75,18 @@ static int* g_cell_keys = NULL;
 static int* g_indices = NULL;
 static int* g_cell_start = NULL;
 static int* g_cell_end = NULL;
+/* {x,y,z,radius} gathered into broad-phase sort order; shared by the uniform
+ * grid (2D/3D) and HSH paths since only one runs per frame. */
+static float4* g_sorted_pos_rad = NULL;
 static unsigned int* g_lbvh_morton = NULL;
 static int* g_lbvh_indices = NULL;
-static float* g_lbvh_aabb_min_x = NULL;
-static float* g_lbvh_aabb_min_y = NULL;
-static float* g_lbvh_aabb_max_x = NULL;
-static float* g_lbvh_aabb_max_y = NULL;
+/* Per-node AABB packed as {min_x, min_y, max_x, max_y} — one 128-bit load per
+ * traversal step instead of four scattered float loads. */
+static float4* g_lbvh_aabb = NULL;
+/* Per-internal-node {left, right} child indices — one 64-bit load instead of
+ * two. */
+static int2* g_lbvh_children = NULL;
 static int* g_lbvh_parent = NULL;
-static int* g_lbvh_left = NULL;
-static int* g_lbvh_right = NULL;
 static int* g_lbvh_flags = NULL;
 /* Hierarchical Spatial Hashing (HSH) persistent device buffers. */
 static int* g_hash_composite_keys = NULL;
@@ -77,6 +100,8 @@ static float g_hash_base_cell_size = 0.0f;
 static cudaGraphicsResource* g_vbo_resource = NULL;
 static cudaEvent_t g_start_event = NULL;
 static cudaEvent_t g_stop_event = NULL;
+static cudaEvent_t g_bp_start_event = NULL;
+static cudaEvent_t g_bp_stop_event = NULL;
 static int g_object_count = 0;
 static int g_width = 1280;
 static int g_height = 720;
@@ -95,6 +120,34 @@ __device__ __host__ static int balls_overlap_3d(const DeviceBall* a, const Devic
     const float radius_sum = a->radius + b->radius;
     const float distance_squared = dx * dx + dy * dy + dz * dz;
     return distance_squared <= radius_sum * radius_sum;
+}
+
+/** Overlap test on packed {x,y,z,radius} records — used by the broad-phase
+ *  kernels so the inner candidate loop touches a compact 16-byte stream
+ *  instead of the full ::DeviceBall (Green 2010 "reorder" data layout). */
+__device__ static inline int pos_rad_overlap_3d(float4 a, float4 b) {
+    const float dx = a.x - b.x;
+    const float dy = a.y - b.y;
+    const float dz = a.z - b.z;
+    const float radius_sum = a.w + b.w;
+    return dx * dx + dy * dy + dz * dz <= radius_sum * radius_sum;
+}
+
+/** Gather {x,y,z,radius} into broad-phase sort order so that cell/bucket
+ *  members are contiguous in memory and the candidate loop reads coalesced.
+ *  Runs once per frame after the key sort (cf. Simon Green, "Particle
+ *  Simulation using CUDA", reorder step). */
+__global__ static void reorder_pos_rad_kernel(
+    const DeviceBall* balls,
+    const int* sorted_indices,
+    int count,
+    float4* sorted_pos_rad) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= count) {
+        return;
+    }
+    const DeviceBall b = balls[sorted_indices[k]];
+    sorted_pos_rad[k] = make_float4(b.x, b.y, b.z, b.radius);
 }
 
 __global__ static void integrate_kernel(
@@ -140,14 +193,6 @@ __global__ static void integrate_kernel(
 
     b.colliding = 0;
     balls[i] = b;
-}
-
-__device__ static Circle ball_to_circle(const DeviceBall* b) {
-    Circle c;
-    c.x = b->x;
-    c.y = b->y;
-    c.radius = b->radius;
-    return c;
 }
 
 __device__ __host__ static void project_ball_to_screen(
@@ -436,11 +481,9 @@ __global__ static void brute_force_collision_kernel(
     unsigned long long local_candidates = 0;
     unsigned long long local_collisions = 0;
     const DeviceBall a = balls[i];
-    const Circle a_circle = ball_to_circle(&a);
 
     for (int j = i + 1; j < count; ++j) {
         const DeviceBall b = balls[j];
-        const Circle b_circle = ball_to_circle(&b);
         local_candidates++;
 
         if (balls_overlap_3d(&a, &b)) {
@@ -454,12 +497,8 @@ __global__ static void brute_force_collision_kernel(
         }
     }
 
-    if (local_candidates > 0) {
-        atomicAdd(candidate_pair_count, local_candidates);
-    }
-    if (local_collisions > 0) {
-        atomicAdd(collision_count, local_collisions);
-    }
+    warp_accumulate_u64(candidate_pair_count, local_candidates);
+    warp_accumulate_u64(collision_count, local_collisions);
 }
 
 __device__ static int clamp_int_device(int value, int lo, int hi) {
@@ -537,6 +576,7 @@ __global__ static void grid_collision_kernel(
     DeviceBall* balls,
     const int* sorted_cell_keys,
     const int* sorted_indices,
+    const float4* sorted_pos_rad,
     const int* cell_start,
     const int* cell_end,
     int count,
@@ -558,15 +598,14 @@ __global__ static void grid_collision_kernel(
     }
 
     const int object_index = sorted_indices[sorted_pos];
-    const DeviceBall self = balls[object_index];
-    const Circle self_circle = ball_to_circle(&self);
+    const float4 self_pr = sorted_pos_rad[sorted_pos];
     const int cell_id = sorted_cell_keys[sorted_pos];
     const int cell_x = cell_id % grid_width;
     const int cell_y = cell_id / grid_width;
 
     unsigned long long local_candidates = 0;
     unsigned long long local_collisions = 0;
-    int neighbor_range = (int)ceilf((self.radius + max_radius) / cell_size);
+    int neighbor_range = (int)ceilf((self_pr.w + max_radius) / cell_size);
     if (neighbor_range < 1) {
         neighbor_range = 1;
     }
@@ -592,9 +631,7 @@ __global__ static void grid_collision_kernel(
                     continue;
                 }
                 local_candidates++;
-                const DeviceBall other = balls[other_index];
-                const Circle other_circle = ball_to_circle(&other);
-                if (balls_overlap_3d(&self, &other)) {
+                if (pos_rad_overlap_3d(self_pr, sorted_pos_rad[p])) {
                     balls[object_index].colliding = 1;
                     balls[other_index].colliding = 1;
                     accumulate_collision_response(
@@ -607,18 +644,15 @@ __global__ static void grid_collision_kernel(
         }
     }
 
-    if (local_candidates > 0) {
-        atomicAdd(candidate_pair_count, local_candidates);
-    }
-    if (local_collisions > 0) {
-        atomicAdd(collision_count, local_collisions);
-    }
+    warp_accumulate_u64(candidate_pair_count, local_candidates);
+    warp_accumulate_u64(collision_count, local_collisions);
 }
 
 __global__ static void grid_collision_3d_kernel(
     DeviceBall* balls,
     const int* sorted_cell_keys,
     const int* sorted_indices,
+    const float4* sorted_pos_rad,
     const int* cell_start,
     const int* cell_end,
     int count,
@@ -641,7 +675,7 @@ __global__ static void grid_collision_3d_kernel(
     }
 
     const int object_index = sorted_indices[sorted_pos];
-    const DeviceBall self = balls[object_index];
+    const float4 self_pr = sorted_pos_rad[sorted_pos];
     const int cell_id = sorted_cell_keys[sorted_pos];
     const int xy_cells = grid_width * grid_height;
     const int cell_z = cell_id / xy_cells;
@@ -651,7 +685,7 @@ __global__ static void grid_collision_3d_kernel(
 
     unsigned long long local_candidates = 0;
     unsigned long long local_collisions = 0;
-    int neighbor_range = (int)ceilf((self.radius + max_radius) / cell_size);
+    int neighbor_range = (int)ceilf((self_pr.w + max_radius) / cell_size);
     if (neighbor_range < 1) {
         neighbor_range = 1;
     }
@@ -680,8 +714,7 @@ __global__ static void grid_collision_3d_kernel(
                         continue;
                     }
                     local_candidates++;
-                    const DeviceBall other = balls[other_index];
-                    if (balls_overlap_3d(&self, &other)) {
+                    if (pos_rad_overlap_3d(self_pr, sorted_pos_rad[p])) {
                         balls[object_index].colliding = 1;
                         balls[other_index].colliding = 1;
                         accumulate_collision_response(
@@ -695,12 +728,8 @@ __global__ static void grid_collision_3d_kernel(
         }
     }
 
-    if (local_candidates > 0) {
-        atomicAdd(candidate_pair_count, local_candidates);
-    }
-    if (local_collisions > 0) {
-        atomicAdd(collision_count, local_collisions);
-    }
+    warp_accumulate_u64(candidate_pair_count, local_candidates);
+    warp_accumulate_u64(collision_count, local_collisions);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,8 +788,7 @@ __global__ static void lbvh_build_radix_tree_kernel(
     const unsigned int* morton_codes,
     int count,
     int* parent,
-    int* left_child,
-    int* right_child) {
+    int2* children) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count - 1) {
         return;
@@ -800,8 +828,7 @@ __global__ static void lbvh_build_radix_tree_kernel(
     const int left = (min(i, j) == split) ? (count - 1 + split) : split;
     const int right = (max(i, j) == split + 1) ? (count - 1 + split + 1) : (split + 1);
 
-    left_child[i] = left;
-    right_child[i] = right;
+    children[i] = make_int2(left, right);
     parent[left] = i;
     parent[right] = i;
 }
@@ -811,13 +838,9 @@ __global__ static void lbvh_aabbs_kernel(
     const int* indices,
     int count,
     const int* parent,
-    const int* left_child,
-    const int* right_child,
+    const int2* children,
     int* flags,
-    float* aabb_min_x,
-    float* aabb_min_y,
-    float* aabb_max_x,
-    float* aabb_max_y) {
+    float4* aabb) {
     const int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (leaf_idx >= count) {
         return;
@@ -829,10 +852,7 @@ __global__ static void lbvh_aabbs_kernel(
     const float cy = balls[obj_idx].y;
     const float rad = balls[obj_idx].radius;
 
-    aabb_min_x[node_idx] = cx - rad;
-    aabb_min_y[node_idx] = cy - rad;
-    aabb_max_x[node_idx] = cx + rad;
-    aabb_max_y[node_idx] = cy + rad;
+    aabb[node_idx] = make_float4(cx - rad, cy - rad, cx + rad, cy + rad);
     // Publish leaf AABB to other threads before signalling via the flag.
     // CUDA atomics are relaxed by default; without this fence the second
     // arrival at the parent may read stale child AABBs and produce a
@@ -845,27 +865,25 @@ __global__ static void lbvh_aabbs_kernel(
         if (old == 0) {
             return;
         }
-        const int l = left_child[current];
-        const int r = right_child[current];
-        aabb_min_x[current] = fminf(aabb_min_x[l], aabb_min_x[r]);
-        aabb_min_y[current] = fminf(aabb_min_y[l], aabb_min_y[r]);
-        aabb_max_x[current] = fmaxf(aabb_max_x[l], aabb_max_x[r]);
-        aabb_max_y[current] = fmaxf(aabb_max_y[l], aabb_max_y[r]);
+        const int2 ch = children[current];
+        const float4 la = aabb[ch.x];
+        const float4 ra = aabb[ch.y];
+        aabb[current] = make_float4(
+            fminf(la.x, ra.x), fminf(la.y, ra.y),
+            fmaxf(la.z, ra.z), fmaxf(la.w, ra.w));
         __threadfence();
         current = parent[current];
     }
 }
 
+#define LBVH_TRAVERSAL_STACK_DEPTH 64
+
 __global__ static void lbvh_traverse_kernel(
     DeviceBall* balls,
     const int* indices,
     int count,
-    const int* left_child,
-    const int* right_child,
-    const float* aabb_min_x,
-    const float* aabb_min_y,
-    const float* aabb_max_x,
-    const float* aabb_max_y,
+    const int2* children,
+    const float4* aabb,
     float* delta_vx,
     float* delta_vy,
     float* delta_vz,
@@ -885,9 +903,13 @@ __global__ static void lbvh_traverse_kernel(
     const float my_min_y = self.y - self.radius;
     const float my_max_x = self.x + self.radius;
     const float my_max_y = self.y + self.radius;
-    const Circle self_circle = ball_to_circle(&self);
 
-    int stack[64];
+    // A Karras LBVH over N leaves has depth ~ceil(log2 N) (the i^j index
+    // tie-break keeps runs of duplicate Morton codes balanced rather than
+    // chained), so 64 covers any object count the visualizer can reach. The
+    // guard below is belt-and-braces against the pathological case so an
+    // overflow can never corrupt neighbouring stack slots.
+    int stack[LBVH_TRAVERSAL_STACK_DEPTH];
     int stack_ptr = 0;
     stack[stack_ptr++] = 0;
 
@@ -896,8 +918,9 @@ __global__ static void lbvh_traverse_kernel(
 
     while (stack_ptr > 0) {
         const int node = stack[--stack_ptr];
-        if (my_max_x < aabb_min_x[node] || my_min_x > aabb_max_x[node]
-            || my_max_y < aabb_min_y[node] || my_min_y > aabb_max_y[node]) {
+        const float4 box = aabb[node];
+        if (my_max_x < box.x || my_min_x > box.z
+            || my_max_y < box.y || my_min_y > box.w) {
             continue;
         }
         if (node >= count - 1) {
@@ -906,7 +929,6 @@ __global__ static void lbvh_traverse_kernel(
                 ++local_candidates;
                 const int other_obj = indices[other_leaf];
                 const DeviceBall other = balls[other_obj];
-                const Circle other_circle = ball_to_circle(&other);
                 if (balls_overlap_3d(&self, &other)) {
                     balls[obj_idx].colliding = 1;
                     balls[other_obj].colliding = 1;
@@ -917,18 +939,15 @@ __global__ static void lbvh_traverse_kernel(
                     ++local_collisions;
                 }
             }
-        } else {
-            stack[stack_ptr++] = left_child[node];
-            stack[stack_ptr++] = right_child[node];
+        } else if (stack_ptr + 2 <= LBVH_TRAVERSAL_STACK_DEPTH) {
+            const int2 ch = children[node];
+            stack[stack_ptr++] = ch.x;
+            stack[stack_ptr++] = ch.y;
         }
     }
 
-    if (local_candidates > 0) {
-        atomicAdd(candidate_pair_count, local_candidates);
-    }
-    if (local_collisions > 0) {
-        atomicAdd(collision_count, local_collisions);
-    }
+    warp_accumulate_u64(candidate_pair_count, local_candidates);
+    warp_accumulate_u64(collision_count, local_collisions);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1005,6 +1024,7 @@ __global__ static void hash_assign_3d_kernel(
 __global__ static void hash_collide_3d_kernel(
     DeviceBall* balls,
     const int* sorted_indices,
+    const float4* sorted_pos_rad,
     const int* cell_start,
     const int* cell_end,
     int count,
@@ -1024,8 +1044,9 @@ __global__ static void hash_collide_3d_kernel(
         return;
     }
 
-    const DeviceBall self = balls[i];
-    const int L_self = hash_select_level_d(self.radius, base_cell_size, num_levels - 1);
+    const DeviceBall self_ball = balls[i];
+    const float4 self_pr = make_float4(self_ball.x, self_ball.y, self_ball.z, self_ball.radius);
+    const int L_self = hash_select_level_d(self_pr.w, base_cell_size, num_levels - 1);
 
     unsigned long long local_collisions = 0;
     unsigned long long local_candidates = 0;
@@ -1033,9 +1054,9 @@ __global__ static void hash_collide_3d_kernel(
     for (int L_q = L_self; L_q < num_levels; ++L_q) {
         const float cs_q = base_cell_size * (float)(1 << L_q);
         const float inv = 1.0f / cs_q;
-        const int self_cx = (int)floorf(self.x * inv);
-        const int self_cy = (int)floorf(self.y * inv);
-        const int self_cz = (int)floorf(self.z * inv);
+        const int self_cx = (int)floorf(self_pr.x * inv);
+        const int self_cy = (int)floorf(self_pr.y * inv);
+        const int self_cz = (int)floorf(self_pr.z * inv);
 
         for (int dz = -1; dz <= 1; ++dz) {
             for (int dy = -1; dy <= 1; ++dy) {
@@ -1052,20 +1073,20 @@ __global__ static void hash_collide_3d_kernel(
                     }
 
                     for (int p = start; p < end; ++p) {
-                        const int j = sorted_indices[p];
-                        const DeviceBall other = balls[j];
-                        const int other_cx = (int)floorf(other.x * inv);
-                        const int other_cy = (int)floorf(other.y * inv);
-                        const int other_cz = (int)floorf(other.z * inv);
+                        const float4 other_pr = sorted_pos_rad[p];
+                        const int other_cx = (int)floorf(other_pr.x * inv);
+                        const int other_cy = (int)floorf(other_pr.y * inv);
+                        const int other_cz = (int)floorf(other_pr.z * inv);
                         if (other_cx != cx || other_cy != cy || other_cz != cz) {
                             continue;
                         }
+                        const int j = sorted_indices[p];
                         if (L_q == L_self && j <= i) {
                             continue;
                         }
 
                         ++local_candidates;
-                        if (balls_overlap_3d(&self, &other)) {
+                        if (pos_rad_overlap_3d(self_pr, other_pr)) {
                             balls[i].colliding = 1;
                             balls[j].colliding = 1;
                             accumulate_collision_response(
@@ -1080,12 +1101,8 @@ __global__ static void hash_collide_3d_kernel(
         }
     }
 
-    if (local_candidates > 0) {
-        atomicAdd(candidate_pair_count, local_candidates);
-    }
-    if (local_collisions > 0) {
-        atomicAdd(collision_count, local_collisions);
-    }
+    warp_accumulate_u64(candidate_pair_count, local_candidates);
+    warp_accumulate_u64(collision_count, local_collisions);
 }
 
 __global__ static void write_vbo_kernel(
@@ -1397,6 +1414,10 @@ static void run_uniform_grid(int blocks, int threads) {
     thrust::device_ptr<int> indices_ptr(g_indices);
     thrust::sort_by_key(keys_ptr, keys_ptr + g_object_count, indices_ptr);
 
+    reorder_pos_rad_kernel<<<blocks, threads>>>(
+        g_balls, g_indices, g_object_count, g_sorted_pos_rad);
+    CUDA_CHECK(cudaGetLastError());
+
     build_cell_ranges_kernel<<<blocks, threads>>>(g_cell_keys, g_cell_start, g_cell_end, g_object_count);
     CUDA_CHECK(cudaGetLastError());
 
@@ -1404,6 +1425,7 @@ static void run_uniform_grid(int blocks, int threads) {
         g_balls,
         g_cell_keys,
         g_indices,
+        g_sorted_pos_rad,
         g_cell_start,
         g_cell_end,
         g_object_count,
@@ -1442,6 +1464,10 @@ static void run_uniform_grid_3d(int blocks, int threads) {
     thrust::device_ptr<int> indices_ptr(g_indices);
     thrust::sort_by_key(keys_ptr, keys_ptr + g_object_count, indices_ptr);
 
+    reorder_pos_rad_kernel<<<blocks, threads>>>(
+        g_balls, g_indices, g_object_count, g_sorted_pos_rad);
+    CUDA_CHECK(cudaGetLastError());
+
     build_cell_ranges_kernel<<<blocks, threads>>>(g_cell_keys, g_cell_start, g_cell_end, g_object_count);
     CUDA_CHECK(cudaGetLastError());
 
@@ -1449,6 +1475,7 @@ static void run_uniform_grid_3d(int blocks, int threads) {
         g_balls,
         g_cell_keys,
         g_indices,
+        g_sorted_pos_rad,
         g_cell_start,
         g_cell_end,
         g_object_count,
@@ -1489,22 +1516,18 @@ static void run_lbvh(int blocks, int threads) {
     if (internal_blocks > 0) {
         lbvh_build_radix_tree_kernel<<<internal_blocks, threads>>>(
             g_lbvh_morton, g_object_count,
-            g_lbvh_parent, g_lbvh_left, g_lbvh_right);
+            g_lbvh_parent, g_lbvh_children);
         CUDA_CHECK(cudaGetLastError());
     }
 
     lbvh_aabbs_kernel<<<blocks, threads>>>(
         g_balls, g_lbvh_indices, g_object_count,
-        g_lbvh_parent, g_lbvh_left, g_lbvh_right, g_lbvh_flags,
-        g_lbvh_aabb_min_x, g_lbvh_aabb_min_y,
-        g_lbvh_aabb_max_x, g_lbvh_aabb_max_y);
+        g_lbvh_parent, g_lbvh_children, g_lbvh_flags, g_lbvh_aabb);
     CUDA_CHECK(cudaGetLastError());
 
     lbvh_traverse_kernel<<<blocks, threads>>>(
         g_balls, g_lbvh_indices, g_object_count,
-        g_lbvh_left, g_lbvh_right,
-        g_lbvh_aabb_min_x, g_lbvh_aabb_min_y,
-        g_lbvh_aabb_max_x, g_lbvh_aabb_max_y,
+        g_lbvh_children, g_lbvh_aabb,
         g_collision_delta_vx, g_collision_delta_vy, g_collision_delta_vz,
         g_collision_delta_x, g_collision_delta_y, g_collision_delta_z,
         g_collision_count, g_candidate_pair_count);
@@ -1532,6 +1555,10 @@ static void run_hash(int blocks, int threads) {
     thrust::device_ptr<int> indices_ptr(g_hash_indices);
     thrust::sort_by_key(keys_ptr, keys_ptr + g_object_count, indices_ptr);
 
+    reorder_pos_rad_kernel<<<blocks, threads>>>(
+        g_balls, g_hash_indices, g_object_count, g_sorted_pos_rad);
+    CUDA_CHECK(cudaGetLastError());
+
     build_cell_ranges_kernel<<<blocks, threads>>>(
         g_hash_composite_keys, g_hash_cell_start, g_hash_cell_end, g_object_count);
     CUDA_CHECK(cudaGetLastError());
@@ -1539,6 +1566,7 @@ static void run_hash(int blocks, int threads) {
     hash_collide_3d_kernel<<<blocks, threads>>>(
         g_balls,
         g_hash_indices,
+        g_sorted_pos_rad,
         g_hash_cell_start,
         g_hash_cell_end,
         g_object_count,
@@ -1610,17 +1638,14 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     CUDA_CHECK(cudaMalloc((void**)&g_indices, (size_t)object_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_cell_start, (size_t)g_total_cells * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_cell_end, (size_t)g_total_cells * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&g_sorted_pos_rad, (size_t)object_count * sizeof(float4)));
 
     const size_t lbvh_nodes = (size_t)object_count * 2 - 1;
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_morton, (size_t)object_count * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_indices, (size_t)object_count * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_min_x, lbvh_nodes * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_min_y, lbvh_nodes * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_max_x, lbvh_nodes * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_max_y, lbvh_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb, lbvh_nodes * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_children, lbvh_nodes * sizeof(int2)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_parent, lbvh_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_left, lbvh_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_right, lbvh_nodes * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_flags, lbvh_nodes * sizeof(int)));
 
     /* HSH: hash table sized for the visualizer's worst-case (max levels +
@@ -1640,6 +1665,8 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&g_vbo_resource, vbo, cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaEventCreate(&g_start_event));
     CUDA_CHECK(cudaEventCreate(&g_stop_event));
+    CUDA_CHECK(cudaEventCreate(&g_bp_start_event));
+    CUDA_CHECK(cudaEventCreate(&g_bp_stop_event));
 
     return cuda_visualizer_reset(0, RADIUS_PROFILE_NARROW);
 }
@@ -1705,6 +1732,10 @@ extern "C" void cuda_visualizer_destroy(void) {
         CUDA_CHECK(cudaFree(g_cell_end));
         g_cell_end = NULL;
     }
+    if (g_sorted_pos_rad != NULL) {
+        CUDA_CHECK(cudaFree(g_sorted_pos_rad));
+        g_sorted_pos_rad = NULL;
+    }
     if (g_lbvh_morton != NULL) {
         CUDA_CHECK(cudaFree(g_lbvh_morton));
         g_lbvh_morton = NULL;
@@ -1713,33 +1744,17 @@ extern "C" void cuda_visualizer_destroy(void) {
         CUDA_CHECK(cudaFree(g_lbvh_indices));
         g_lbvh_indices = NULL;
     }
-    if (g_lbvh_aabb_min_x != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_aabb_min_x));
-        g_lbvh_aabb_min_x = NULL;
+    if (g_lbvh_aabb != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb));
+        g_lbvh_aabb = NULL;
     }
-    if (g_lbvh_aabb_min_y != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_aabb_min_y));
-        g_lbvh_aabb_min_y = NULL;
-    }
-    if (g_lbvh_aabb_max_x != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_aabb_max_x));
-        g_lbvh_aabb_max_x = NULL;
-    }
-    if (g_lbvh_aabb_max_y != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_aabb_max_y));
-        g_lbvh_aabb_max_y = NULL;
+    if (g_lbvh_children != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_children));
+        g_lbvh_children = NULL;
     }
     if (g_lbvh_parent != NULL) {
         CUDA_CHECK(cudaFree(g_lbvh_parent));
         g_lbvh_parent = NULL;
-    }
-    if (g_lbvh_left != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_left));
-        g_lbvh_left = NULL;
-    }
-    if (g_lbvh_right != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_right));
-        g_lbvh_right = NULL;
     }
     if (g_lbvh_flags != NULL) {
         CUDA_CHECK(cudaFree(g_lbvh_flags));
@@ -1772,6 +1787,14 @@ extern "C" void cuda_visualizer_destroy(void) {
     if (g_stop_event != NULL) {
         CUDA_CHECK(cudaEventDestroy(g_stop_event));
         g_stop_event = NULL;
+    }
+    if (g_bp_start_event != NULL) {
+        CUDA_CHECK(cudaEventDestroy(g_bp_start_event));
+        g_bp_start_event = NULL;
+    }
+    if (g_bp_stop_event != NULL) {
+        CUDA_CHECK(cudaEventDestroy(g_bp_stop_event));
+        g_bp_stop_event = NULL;
     }
 }
 
@@ -1831,7 +1854,9 @@ extern "C" int cuda_visualizer_step(
         cpu_integrate(g_host_balls, g_object_count, dt, g_width, g_height, g_depth);
         unsigned long long h_collisions = 0;
         unsigned long long h_candidates = 0;
+        const double bp0 = timer_now_ms();
         cpu_brute_force_collide(g_host_balls, g_object_count, &h_collisions, &h_candidates);
+        const double bp1 = timer_now_ms();
         cpu_clamp_to_bounds(g_host_balls, g_object_count, g_width, g_height, g_depth);
         cpu_apply_mouse_collision(
             g_host_balls,
@@ -1859,6 +1884,7 @@ extern "C" int cuda_visualizer_step(
         metrics->collision_count = h_collisions;
         metrics->candidate_pair_count = h_candidates;
         metrics->gpu_time_ms = (float)(t1 - t0);
+        metrics->broadphase_ms = (float)(bp1 - bp0);
         return 1;
     }
 
@@ -1875,6 +1901,9 @@ extern "C" int cuda_visualizer_step(
     integrate_kernel<<<blocks, threads>>>(g_balls, g_object_count, dt, g_width, g_height, g_depth);
     CUDA_CHECK(cudaGetLastError());
 
+    /* Time the broad-phase (build + query) on its own so the methods can be
+     * compared without the fixed integrate/response/mouse/VBO-write overhead. */
+    CUDA_CHECK(cudaEventRecord(g_bp_start_event));
     if (g_mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID) {
         run_uniform_grid(blocks, threads);
     } else if (g_mode == VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D) {
@@ -1886,6 +1915,7 @@ extern "C" int cuda_visualizer_step(
     } else {
         run_brute_force(blocks, threads);
     }
+    CUDA_CHECK(cudaEventRecord(g_bp_stop_event));
 
     apply_collision_response_kernel<<<blocks, threads>>>(
         g_balls,
@@ -1925,6 +1955,7 @@ extern "C" int cuda_visualizer_step(
     CUDA_CHECK(cudaMemcpy(&metrics->collision_count, g_collision_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&metrics->candidate_pair_count, g_candidate_pair_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaEventElapsedTime(&metrics->gpu_time_ms, g_start_event, g_stop_event));
+    CUDA_CHECK(cudaEventElapsedTime(&metrics->broadphase_ms, g_bp_start_event, g_bp_stop_event));
 
     return 1;
 }

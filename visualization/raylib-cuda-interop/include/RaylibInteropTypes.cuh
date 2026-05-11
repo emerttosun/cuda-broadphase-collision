@@ -29,7 +29,14 @@ typedef struct RenderVertex {
 typedef struct VisualizerMetrics {
     unsigned long long collision_count;
     unsigned long long candidate_pair_count;
+    /* Whole simulation step on the device: integrate + broad-phase + collision
+     * response + mouse + VBO write (CPU mode: integrate + collide + clamp +
+     * mouse on the host). GL interop map/unmap included. */
     float gpu_time_ms;
+    /* Broad-phase only: build + query for the selected method (CPU mode: just
+     * the brute-force collide pass). Lets the methods be compared without the
+     * fixed per-frame physics/render overhead muddying the numbers. */
+    float broadphase_ms;
 } VisualizerMetrics;
 
 typedef struct VisualizerCamera {

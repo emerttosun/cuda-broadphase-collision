@@ -626,3 +626,64 @@ Tooling:
 - [NVIDIA Thrust + CUB 1.11 update](https://developer.nvidia.com/blog/thrust-cub-1-11/)
 - ["Thinking Parallel" üçlemesi — NVIDIA blog](https://developer.nvidia.com/blog/thinking-parallel-part-i-collision-detection-gpu/)
 - [Maximizing Parallel Hash Maps on GPUs — NVIDIA blog](https://developer.nvidia.com/blog/maximizing-performance-with-massively-parallel-hash-maps-on-gpus/)
+
+---
+
+# Uygulama Durumu — `spatial-hash` dalı (Mayıs 2026)
+
+Bu bölüm, yukarıdaki yol haritasından **görselleştiricide (`visualization/raylib-cuda-interop/`)**
+fiilen uygulanan maddeleri kaydeder. Çekirdek benchmark (`src/`) henüz dokunulmadı;
+oradaki karşılığı (parity testi, plot betiği, CSV warm-up, vb.) hâlâ açık.
+
+## 0. Broad-phase süre ölçümü (görselleştirici)
+
+Önceden overlay'de tek bir "CUDA compute: X ms" vardı ve bu, frame'in **tüm** GPU
+işiydi (integrate + broad-phase + collision response + mouse + VBO yazımı + GL interop).
+Yöntemleri karşılaştırmak için yetersiz: her birinin üstüne aynı sabit fizik/render
+yükü biniyordu.
+
+Eklenenler:
+- `VisualizerMetrics`'e `broadphase_ms` alanı (`RaylibInteropTypes.cuh`).
+- İkinci bir CUDA event çifti (`g_bp_start_event` / `g_bp_stop_event`), yalnızca
+  `run_uniform_grid()` / `run_uniform_grid_3d()` / `run_lbvh()` / `run_hash()` /
+  `run_brute_force()` çağrısının etrafında — yani seçili yöntemin **build + query**'si.
+  CPU brute modunda: yalnızca `cpu_brute_force_collide()` etrafında host wall-clock.
+- Overlay artık iki satır gösteriyor: `Broad-phase (<yöntem>): X ms` ve
+  `Frame GPU: Y ms` (CPU modunda `CPU step: Y ms`).
+- Sınır: `broadphase_ms` hâlâ narrow-phase çarpışma tepkisini içeriyor, çünkü
+  `accumulate_collision_response()` broad-phase kernel'lerinin içinden çağrılıyor.
+  Tam saflaştırma için ayrı bir `apply_response_kernel` gerekir — bkz. madde 4.
+
+## 1. Faz-A optimizasyonları (görselleştirici kernel'leri)
+
+| Roadmap | Madde | Durum | Notlar |
+|---|---|---|---|
+| 4.4 yan etkisi | Reorder adımı (Green 2010) — uniform grid 2D/3D + HSH | **Yapıldı** | `reorder_pos_rad_kernel` sort'tan sonra `{x,y,z,radius}`'ı sort düzenine `float4* g_sorted_pos_rad` olarak topluyor; collision kernel'leri aday döngüsünde koca `DeviceBall` yerine bu kompakt diziyi coalesced okuyor (`pos_rad_overlap_3d`). Orijinal indeksler hâlâ `sorted_indices[]`'ten (dedup + writeback). 3 buffer paylaşımlı (aynı anda tek yöntem çalışıyor). |
+| §4.3 (atomic baskısı) | Warp-aggregated atomics | **Yapıldı** | `warp_accumulate_u64()` (`cg::coalesced_threads` + `cg::reduce`); 5 kernelin sonundaki `collision_count` / `candidate_pair_count` `atomicAdd` çiftleri warp başına tek atomic'e indi. Kısmi tail-warp ve independent thread scheduling güvenli. |
+| Chitalu 2020 / layout | LBVH AABB/node dizilerini paketle | **Yapıldı** | 4× `float* aabb_*` → tek `float4* g_lbvh_aabb`; `int* left/right` → `int2* g_lbvh_children`. Traversal adımı başına 1×128-bit + 1×64-bit yük (eskiden 6 dağınık yük). 2 buffer eksildi. |
+| — | LBVH traversal stack | **İncelendi + sertleştirildi** | Karras `i^j` tie-break tekrarlı Morton kodlarını dengeli alt-ağaç yaptığı için derinlik ~⌈log2 N⌉ → `stack[64]` visualizer'ın obje sayıları için fazlasıyla yeterli. Yine de `else if (stack_ptr + 2 <= 64)` koruması eklendi (taşmada komşu slot bozulmasını engeller; orijinalde koruma yoktu). Stack'i shared memory'ye taşımak yapılmadı. |
+| — | Ölü kod | **Temizlendi** | Kullanılmayan `ball_to_circle()` + 6 çağrı yeri ve artık gereksiz `Circle.h` / `CollisionMath.h` include'ları kaldırıldı. |
+
+Davranış değişmedi: beş kernelin `collision_count` / `candidate_pair_count` çıktıları
+aynı; yalnızca bellek erişim deseni ve atomik trafiği değişti. (Parity testi hâlâ
+yazılmadı — değişiklikler `collision_count`'u korumalı, ama otomatik doğrulama yok.)
+
+## 2. Hâlâ açık (görselleştirici tarafı)
+
+- **Madde 4 — broad-phase ↔ collision-response ayrımı**: `accumulate_collision_response`
+  ayrı kernele çıkarılırsa `broadphase_ms` saf broad-phase olur ve broad-phase
+  fizikten bağımsızlaşır (daha doğru tasarım).
+- **Madde 5 — tiled (shared-memory) brute force**: baseline kerneli %30-50+ hızlandırır.
+- LBVH: stack→shared memory, leaf bundling (K primitive/yaprak), 64-bit Morton.
+- HSH: hash-collision filtresindeki `floorf` üçlüsünü `hash_assign` aşamasında bir
+  kez hesaplanan paketli `(cx,cy,cz)` ile değiştirmek (int karşılaştırma).
+
+## 3. Hâlâ açık (çekirdek benchmark `src/` tarafı)
+
+- A.4 parity testi (`tests/test_parity.c`), A.6 plot betiği (`scripts/plot_results.py`).
+- CSV: `cuda_brute_force` ilk satırındaki ~100 ms CUDA context-init yükünü warm-up
+  çağrısıyla ölçüm dışına almak; `total_time_ms`'ten host-side grid-stats döngüsünü
+  çıkarmak (madde 4.3 rafine).
+- A.1 (Morton cell-id), A.2 (doğrudan CUB radix sort), A.3 (multi-stream) — `src/` tarafına da.
+- Yukarıdaki görselleştirici optimizasyonlarının (`src/CudaGrid.cu`, `src/CudaHash.cu`,
+  `src/CudaLbvh.cu`) çekirdek modüllere taşınması.

@@ -43,6 +43,13 @@ def sorted_xy(items: list[dict[str, str]], x_key: str, y_key: str):
     return [p[0] for p in points], [p[1] for p in points]
 
 
+def series_label(row: dict[str, str]) -> str:
+    method = row["method_name"]
+    if method == "cuda_uniform_grid":
+        return f"{method} cell={float(row['grid_cell_size']):g}"
+    return method
+
+
 def save_line_plot(rows, out_dir: Path, y_key: str, y_label: str, filename: str, log_y: bool = True):
     plt = require_matplotlib()
     has_radius_profile = "radius_profile" in rows[0]
@@ -52,7 +59,10 @@ def save_line_plot(rows, out_dir: Path, y_key: str, y_label: str, filename: str,
         radius_profile = key_values[1] if has_radius_profile else None
         suffix = f"{distribution}_{radius_profile}" if radius_profile is not None else distribution
         plt.figure(figsize=(9, 5))
-        for (method,), items in sorted(group_by(subset, "method_name").items()):
+        by_series = defaultdict(list)
+        for row in subset:
+            by_series[series_label(row)].append(row)
+        for method, items in sorted(by_series.items()):
             x, y = sorted_xy(items, "object_count", y_key)
             plt.plot(x, y, marker="o", linewidth=1.8, label=method)
         plt.xlabel("Object count")

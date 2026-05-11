@@ -368,10 +368,10 @@ int main(int argc, char** argv) {
             DrawCircle((int)mouse.x, (int)mouse.y, 3.0f, (Color){255, 255, 255, 160});
         }
 
-        const char* compute_label =
-            (mode == VISUALIZER_MODE_CPU_BRUTE_FORCE) ? "CPU compute" : "CUDA compute";
+        const int cpu_mode = (mode == VISUALIZER_MODE_CPU_BRUTE_FORCE);
+        const char* frame_label = cpu_mode ? "CPU step" : "Frame GPU";
 
-        DrawRectangle(12, 12, 560, 316, (Color){18, 22, 30, 220});
+        DrawRectangle(12, 12, 560, 340, (Color){18, 22, 30, 220});
         DrawText("Raylib + CUDA-OpenGL Interop 3D", 24, 24, 20, RAYWHITE);
         DrawText(TextFormat("Objects: %d  [+/-]", object_count), 24, 52, 18, LIGHTGRAY);
         DrawText(TextFormat("Distribution: %s  [C]", clustered ? "clustered" : "uniform"), 24, 76, 18, LIGHTGRAY);
@@ -384,15 +384,17 @@ int main(int argc, char** argv) {
                  24, 172, 18, LIGHTGRAY);
         DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 196, 18, LIGHTGRAY);
         DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 220, 18, LIGHTGRAY);
-        DrawText(TextFormat("%s: %.3f ms", compute_label, (double)metrics.gpu_time_ms), 24, 244, 18, LIGHTGRAY);
-        DrawText(TextFormat("FPS: %d", GetFPS()), 24, 268, 18, LIGHTGRAY);
+        DrawText(TextFormat("Broad-phase (%s): %.3f ms", mode_name(mode), (double)metrics.broadphase_ms), 24, 244, 18,
+                 (Color){160, 230, 180, 255});
+        DrawText(TextFormat("%s: %.3f ms", frame_label, (double)metrics.gpu_time_ms), 24, 268, 18, LIGHTGRAY);
+        DrawText(TextFormat("FPS: %d", GetFPS()), 24, 292, 18, LIGHTGRAY);
         DrawText(TextFormat("Camera: yaw %.1f pitch %.1f dist %.0f  [RMB/WASD/QE/F]",
                             (double)(camera.yaw * 57.29578f),
                             (double)(camera.pitch * 57.29578f),
                             (double)camera.distance),
-                 24, 292, 18, LIGHTGRAY);
+                 24, 316, 18, LIGHTGRAY);
         if (auto_mode_enabled && GetTime() < auto_notice_until) {
-            DrawText(auto_notice, 24, 340, 22, (Color){160, 230, 180, 255});
+            DrawText(auto_notice, 24, 364, 22, (Color){160, 230, 180, 255});
         }
 
         EndDrawing();
