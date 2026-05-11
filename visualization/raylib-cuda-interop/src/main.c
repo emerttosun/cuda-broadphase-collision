@@ -10,10 +10,10 @@
 
 static const int kWindowWidth = 1280;
 static const int kWindowHeight = 720;
-static const float kBoxDepth = 540.0f;
+static const float kBoxDepth = 1620.0f;
 static const float kMouseColliderRadius = 54.0f;
 static const float kCameraMinDistance = 90.0f;
-static const float kCameraMaxDistance = 2200.0f;
+static const float kCameraMaxDistance = 4200.0f;
 
 static const char* kVertexShader =
     "#version 330 core\n"
@@ -162,6 +162,21 @@ static const int kCountStep = 500;
 static const int kCountMin = 100;
 static const int kCountMax = 20000;
 static const int kVisualizerModeCount = 6;
+static const int kAutoMinSamplesPerMode = 4;
+static const int kAutoProbeIntervalFrames = 60;
+static const float kAutoAverageBlend = 0.20f;
+
+typedef struct AutoModePerf {
+    int mode;
+    float average_ms;
+    int sample_count;
+} AutoModePerf;
+
+typedef struct AutoSelector {
+    AutoModePerf modes[3];
+    int probe_cursor;
+    int frames_since_probe;
+} AutoSelector;
 
 static const char* visualizer_radius_profile_name(RadiusProfile profile) {
     return radius_profile_name(profile);
@@ -178,30 +193,127 @@ static const char* mode_name(int mode) {
     }
 }
 
-static int choose_auto_mode(int object_count, int clustered, RadiusProfile radius_profile) {
-    if (object_count <= 700 && !clustered && radius_profile == RADIUS_PROFILE_NARROW) {
-        return VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+static void auto_selector_reset(AutoSelector* selector) {
+    selector->modes[0].mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+    selector->modes[1].mode = VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D;
+    selector->modes[2].mode = VISUALIZER_MODE_CUDA_LBVH;
+    for (int i = 0; i < 3; ++i) {
+        selector->modes[i].average_ms = 0.0f;
+        selector->modes[i].sample_count = 0;
     }
-    if (clustered && radius_profile == RADIUS_PROFILE_EXTREME && object_count >= 4000) {
-        return VISUALIZER_MODE_CUDA_LBVH;
+    selector->probe_cursor = 0;
+    selector->frames_since_probe = kAutoProbeIntervalFrames;
+}
+
+static int auto_mode_allowed(int mode, int object_count) {
+    if (mode == VISUALIZER_MODE_CUDA_BRUTE_FORCE && object_count > 20000) {
+        return 0;
+    }
+    return mode != VISUALIZER_MODE_CPU_BRUTE_FORCE;
+}
+
+static int auto_selector_index_for_mode(const AutoSelector* selector, int mode) {
+    for (int i = 0; i < 3; ++i) {
+        if (selector->modes[i].mode == mode) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void auto_selector_record(AutoSelector* selector, int mode, float time_ms) {
+    const int index = auto_selector_index_for_mode(selector, mode);
+    if (index < 0 || time_ms <= 0.0f) {
+        return;
+    }
+
+    AutoModePerf* perf = &selector->modes[index];
+    if (perf->sample_count == 0) {
+        perf->average_ms = time_ms;
+    } else {
+        perf->average_ms = perf->average_ms * (1.0f - kAutoAverageBlend) + time_ms * kAutoAverageBlend;
+    }
+    perf->sample_count++;
+}
+
+static int auto_selector_best_mode(const AutoSelector* selector, int object_count) {
+    int best_mode = -1;
+    float best_time = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        const AutoModePerf* perf = &selector->modes[i];
+        if (!auto_mode_allowed(perf->mode, object_count)
+            || perf->sample_count < kAutoMinSamplesPerMode) {
+            continue;
+        }
+        if (best_mode < 0 || perf->average_ms < best_time) {
+            best_mode = perf->mode;
+            best_time = perf->average_ms;
+        }
+    }
+    return best_mode;
+}
+
+static int auto_selector_next_probe(AutoSelector* selector, int object_count) {
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int step = 0; step < 3; ++step) {
+            const int index = (selector->probe_cursor + step) % 3;
+            const AutoModePerf* perf = &selector->modes[index];
+            if (!auto_mode_allowed(perf->mode, object_count)) {
+                continue;
+            }
+            if (pass == 0 && perf->sample_count >= kAutoMinSamplesPerMode) {
+                continue;
+            }
+            selector->probe_cursor = (index + 1) % 3;
+            selector->frames_since_probe = 0;
+            return perf->mode;
+        }
     }
     return VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D;
 }
 
-static const char* auto_mode_reason(int object_count, int clustered, RadiusProfile radius_profile) {
+static int auto_selector_choose_mode(
+    AutoSelector* selector,
+    int object_count,
+    int clustered,
+    RadiusProfile radius_profile) {
+    (void)clustered;
+    (void)radius_profile;
+    const int best_mode = auto_selector_best_mode(selector, object_count);
+    if (best_mode < 0) {
+        return auto_selector_next_probe(selector, object_count);
+    }
+    if (selector->frames_since_probe >= kAutoProbeIntervalFrames) {
+        return auto_selector_next_probe(selector, object_count);
+    }
+    selector->frames_since_probe++;
+    return best_mode;
+}
+
+static const char* auto_mode_reason(
+    const AutoSelector* selector,
+    int mode,
+    int object_count,
+    int clustered,
+    RadiusProfile radius_profile) {
+    const int index = auto_selector_index_for_mode(selector, mode);
+    if (index >= 0 && selector->modes[index].sample_count >= kAutoMinSamplesPerMode) {
+        return "fastest recent measured average";
+    }
+    (void)object_count;
     if (object_count <= 700 && !clustered && radius_profile == RADIUS_PROFILE_NARROW) {
-        return "small sparse scene: brute force avoids grid/sort overhead";
+        return "warming up: small sparse scene fallback prefers brute force";
     }
     if (clustered && radius_profile == RADIUS_PROFILE_EXTREME && object_count >= 4000) {
-        return "clustered extreme radii: LBVH avoids overloaded grid cells";
+        return "warming up: clustered extreme fallback probes LBVH";
     }
     if (clustered) {
-        return "clustered 3D scene: 3D grid reduces z-axis false positives";
+        return "warming up: clustered 3D scene fallback";
     }
     if (radius_profile != RADIUS_PROFILE_NARROW) {
-        return "varied radii: 3D grid keeps candidate pairs bounded";
+        return "warming up: varied radii fallback";
     }
-    return "medium/large 3D scene: 3D grid is expected fastest";
+    return "warming up candidate methods";
 }
 
 static int recreate_simulation(unsigned int* vao, unsigned int* vbo,
@@ -251,6 +363,8 @@ int main(int argc, char** argv) {
     int auto_mode_enabled = 0;
     double auto_notice_until = 0.0;
     char auto_notice[128] = "";
+    AutoSelector auto_selector;
+    auto_selector_reset(&auto_selector);
     RadiusProfile radius_profile = RADIUS_PROFILE_NARROW;
     VisualizerCamera camera = {0.0f, 0.0f, 900.0f};
     VisualizerMetrics metrics;
@@ -264,15 +378,18 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_C)) {
             clustered = !clustered;
             cuda_visualizer_reset(clustered, radius_profile);
+            auto_selector_reset(&auto_selector);
             memset(&metrics, 0, sizeof(metrics));
         }
         if (IsKeyPressed(KEY_V)) {
             radius_profile = radius_profile_next(radius_profile);
             cuda_visualizer_reset(clustered, radius_profile);
+            auto_selector_reset(&auto_selector);
             memset(&metrics, 0, sizeof(metrics));
         }
         if (IsKeyPressed(KEY_R)) {
             cuda_visualizer_reset(clustered, radius_profile);
+            auto_selector_reset(&auto_selector);
             memset(&metrics, 0, sizeof(metrics));
         }
         if (IsKeyPressed(KEY_G)) {
@@ -283,7 +400,9 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_T)) {
             auto_mode_enabled = !auto_mode_enabled;
             if (auto_mode_enabled) {
-                const int selected_mode = choose_auto_mode(object_count, clustered, radius_profile);
+                auto_selector_reset(&auto_selector);
+                const int selected_mode =
+                    auto_selector_choose_mode(&auto_selector, object_count, clustered, radius_profile);
                 if (selected_mode != mode) {
                     mode = selected_mode;
                     cuda_visualizer_set_mode(mode);
@@ -326,7 +445,8 @@ int main(int argc, char** argv) {
         }
         if (new_count != object_count) {
             if (auto_mode_enabled) {
-                mode = choose_auto_mode(new_count, clustered, radius_profile);
+                auto_selector_reset(&auto_selector);
+                mode = auto_selector_choose_mode(&auto_selector, new_count, clustered, radius_profile);
             }
             if (recreate_simulation(&vao, &vbo, new_count, mode, clustered, radius_profile)) {
                 object_count = new_count;
@@ -339,7 +459,8 @@ int main(int argc, char** argv) {
         }
 
         if (auto_mode_enabled) {
-            const int selected_mode = choose_auto_mode(object_count, clustered, radius_profile);
+            const int selected_mode =
+                auto_selector_choose_mode(&auto_selector, object_count, clustered, radius_profile);
             if (selected_mode != mode) {
                 mode = selected_mode;
                 cuda_visualizer_set_mode(mode);
@@ -356,6 +477,9 @@ int main(int argc, char** argv) {
 
         if (!paused) {
             cuda_visualizer_step(frame_dt, mouse.x, mouse.y, mouse_active, &camera, &metrics);
+            if (auto_mode_enabled) {
+                auto_selector_record(&auto_selector, mode, metrics.gpu_time_ms);
+            }
         }
 
         BeginDrawing();
@@ -380,7 +504,9 @@ int main(int argc, char** argv) {
         DrawText(TextFormat("Auto: %s  [T]", auto_mode_enabled ? "ON" : "OFF"), 24, 148, 18,
                  auto_mode_enabled ? (Color){160, 230, 180, 255} : LIGHTGRAY);
         DrawText(TextFormat("Auto reason: %s",
-                            auto_mode_enabled ? auto_mode_reason(object_count, clustered, radius_profile) : "manual mode"),
+                            auto_mode_enabled
+                                ? auto_mode_reason(&auto_selector, mode, object_count, clustered, radius_profile)
+                                : "manual mode"),
                  24, 172, 18, LIGHTGRAY);
         DrawText(TextFormat("Collisions: %llu", metrics.collision_count), 24, 196, 18, LIGHTGRAY);
         DrawText(TextFormat("Candidate pairs: %llu", metrics.candidate_pair_count), 24, 220, 18, LIGHTGRAY);

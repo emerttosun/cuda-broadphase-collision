@@ -106,7 +106,7 @@ static cudaEvent_t g_bp_stop_event = NULL;
 static int g_object_count = 0;
 static int g_width = 1280;
 static int g_height = 720;
-static float g_depth = 540.0f;
+static float g_depth = 1620.0f;
 static int g_grid_width = 0;
 static int g_grid_height = 0;
 static int g_grid_depth = 0;
@@ -1639,7 +1639,7 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     g_object_count = object_count;
     g_width = width;
     g_height = height;
-    g_depth = fminf((float)width, (float)height) * 0.75f;
+    g_depth = fminf((float)width, (float)height) * 2.25f;
     g_grid_width = (int)ceilf((float)width / VISUALIZER_GRID_CELL_SIZE);
     g_grid_height = (int)ceilf((float)height / VISUALIZER_GRID_CELL_SIZE);
     g_grid_depth = (int)ceilf(g_depth / VISUALIZER_GRID_CELL_SIZE);
