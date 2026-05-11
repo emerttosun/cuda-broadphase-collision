@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
 
     int clustered = 0;
     int paused = 0;
-    int mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+    int mode = VISUALIZER_MODE_CPU_BRUTE_FORCE;
     int auto_mode_enabled = 0;
     double auto_notice_until = 0.0;
     char auto_notice[128] = "";

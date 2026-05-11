@@ -6,12 +6,14 @@
 extern "C" {
 #endif
 
+/* Order here is also the [G]-key cycle order in the visualizer:
+ * CPU brute -> CUDA brute -> uniform grid (2D) -> uniform grid 3D -> LBVH -> hash. */
 typedef enum VisualizerMode {
-    VISUALIZER_MODE_CUDA_BRUTE_FORCE = 0,
-    VISUALIZER_MODE_CUDA_UNIFORM_GRID = 1,
-    VISUALIZER_MODE_CPU_BRUTE_FORCE = 2,
-    VISUALIZER_MODE_CUDA_LBVH = 3,
-    VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D = 4,
+    VISUALIZER_MODE_CPU_BRUTE_FORCE = 0,
+    VISUALIZER_MODE_CUDA_BRUTE_FORCE = 1,
+    VISUALIZER_MODE_CUDA_UNIFORM_GRID = 2,
+    VISUALIZER_MODE_CUDA_UNIFORM_GRID_3D = 3,
+    VISUALIZER_MODE_CUDA_LBVH = 4,
     VISUALIZER_MODE_CUDA_HASH = 5
 } VisualizerMode;
 

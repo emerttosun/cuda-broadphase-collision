@@ -80,9 +80,10 @@ static int* g_cell_end = NULL;
 static float4* g_sorted_pos_rad = NULL;
 static unsigned int* g_lbvh_morton = NULL;
 static int* g_lbvh_indices = NULL;
-/* Per-node AABB packed as {min_x, min_y, max_x, max_y} — one 128-bit load per
- * traversal step instead of four scattered float loads. */
-static float4* g_lbvh_aabb = NULL;
+/* Per-node 3D AABB as two float4s ({min_x,min_y,min_z,_}, {max_x,max_y,max_z,_})
+ * — two 128-bit loads per traversal step instead of six scattered float loads. */
+static float4* g_lbvh_aabb_min = NULL;
+static float4* g_lbvh_aabb_max = NULL;
 /* Per-internal-node {left, right} child indices — one 64-bit load instead of
  * two. */
 static int2* g_lbvh_children = NULL;
@@ -110,7 +111,7 @@ static int g_grid_width = 0;
 static int g_grid_height = 0;
 static int g_grid_depth = 0;
 static int g_total_cells = 0;
-static int g_mode = VISUALIZER_MODE_CUDA_BRUTE_FORCE;
+static int g_mode = VISUALIZER_MODE_CPU_BRUTE_FORCE;
 static RadiusProfile g_radius_profile = RADIUS_PROFILE_NARROW;
 
 __device__ __host__ static int balls_overlap_3d(const DeviceBall* a, const DeviceBall* b) {
@@ -733,28 +734,38 @@ __global__ static void grid_collision_3d_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// LBVH (Karras 2012) — Morton codes + parallel radix tree + AABB traversal.
+// LBVH (Karras 2012) — 3D Morton codes + parallel radix tree + AABB traversal.
 // Tree layout: N leaves at indices [N-1 .. 2N-2], N-1 internal nodes at
 // [0 .. N-2], root = node 0. Sized arrays therefore have 2N-1 entries.
+// Morton codes are 30-bit (10 bits per axis), kept in a uint so the radix
+// sort and the __clz-based delta function below stay 32-bit; the i^j tie-break
+// resolves objects that land in the same 1024^3 cell.
 // ---------------------------------------------------------------------------
 
-__device__ static unsigned int lbvh_part_1_by_1(unsigned int v) {
-    v &= 0x0000FFFFu;
-    v = (v | (v << 8)) & 0x00FF00FFu;
-    v = (v | (v << 4)) & 0x0F0F0F0Fu;
-    v = (v | (v << 2)) & 0x33333333u;
-    v = (v | (v << 1)) & 0x55555555u;
+/** Spread the 10 low bits of @p v so bit i lands at bit 3*i — the per-axis
+ *  half of a 3D Morton (Z-order) code ("Part1By2"). */
+__device__ static unsigned int lbvh_part_1_by_2(unsigned int v) {
+    v &= 0x000003FFu;
+    v = (v | (v << 16)) & 0xFF0000FFu;
+    v = (v | (v <<  8)) & 0x0300F00Fu;
+    v = (v | (v <<  4)) & 0x030C30C3u;
+    v = (v | (v <<  2)) & 0x09249249u;
     return v;
 }
 
-__device__ static unsigned int lbvh_morton2d(float x, float y, float scene_w, float scene_h) {
+__device__ static unsigned int lbvh_morton3d(
+    float x, float y, float z,
+    float scene_w, float scene_h, float scene_d) {
     float fx = x / scene_w;
     float fy = y / scene_h;
-    fx = fmaxf(0.0f, fminf(fx * 65536.0f, 65535.0f));
-    fy = fmaxf(0.0f, fminf(fy * 65536.0f, 65535.0f));
-    const unsigned int xx = lbvh_part_1_by_1((unsigned int)fx);
-    const unsigned int yy = lbvh_part_1_by_1((unsigned int)fy);
-    return (xx << 1) | yy;
+    float fz = z / scene_d;
+    fx = fmaxf(0.0f, fminf(fx * 1024.0f, 1023.0f));
+    fy = fmaxf(0.0f, fminf(fy * 1024.0f, 1023.0f));
+    fz = fmaxf(0.0f, fminf(fz * 1024.0f, 1023.0f));
+    const unsigned int xx = lbvh_part_1_by_2((unsigned int)fx);
+    const unsigned int yy = lbvh_part_1_by_2((unsigned int)fy);
+    const unsigned int zz = lbvh_part_1_by_2((unsigned int)fz);
+    return (zz << 2) | (yy << 1) | xx;
 }
 
 __device__ static int lbvh_common_upper_bits(const unsigned int* morton_codes, int count, int i, int j) {
@@ -775,12 +786,13 @@ __global__ static void lbvh_morton_kernel(
     int* indices,
     int count,
     float scene_w,
-    float scene_h) {
+    float scene_h,
+    float scene_d) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) {
         return;
     }
-    morton_codes[i] = lbvh_morton2d(balls[i].x, balls[i].y, scene_w, scene_h);
+    morton_codes[i] = lbvh_morton3d(balls[i].x, balls[i].y, balls[i].z, scene_w, scene_h, scene_d);
     indices[i] = i;
 }
 
@@ -840,7 +852,8 @@ __global__ static void lbvh_aabbs_kernel(
     const int* parent,
     const int2* children,
     int* flags,
-    float4* aabb) {
+    float4* aabb_min,
+    float4* aabb_max) {
     const int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (leaf_idx >= count) {
         return;
@@ -850,9 +863,11 @@ __global__ static void lbvh_aabbs_kernel(
     const int obj_idx = indices[leaf_idx];
     const float cx = balls[obj_idx].x;
     const float cy = balls[obj_idx].y;
+    const float cz = balls[obj_idx].z;
     const float rad = balls[obj_idx].radius;
 
-    aabb[node_idx] = make_float4(cx - rad, cy - rad, cx + rad, cy + rad);
+    aabb_min[node_idx] = make_float4(cx - rad, cy - rad, cz - rad, 0.0f);
+    aabb_max[node_idx] = make_float4(cx + rad, cy + rad, cz + rad, 0.0f);
     // Publish leaf AABB to other threads before signalling via the flag.
     // CUDA atomics are relaxed by default; without this fence the second
     // arrival at the parent may read stale child AABBs and produce a
@@ -866,11 +881,14 @@ __global__ static void lbvh_aabbs_kernel(
             return;
         }
         const int2 ch = children[current];
-        const float4 la = aabb[ch.x];
-        const float4 ra = aabb[ch.y];
-        aabb[current] = make_float4(
-            fminf(la.x, ra.x), fminf(la.y, ra.y),
-            fmaxf(la.z, ra.z), fmaxf(la.w, ra.w));
+        const float4 lmin = aabb_min[ch.x];
+        const float4 rmin = aabb_min[ch.y];
+        const float4 lmax = aabb_max[ch.x];
+        const float4 rmax = aabb_max[ch.y];
+        aabb_min[current] = make_float4(
+            fminf(lmin.x, rmin.x), fminf(lmin.y, rmin.y), fminf(lmin.z, rmin.z), 0.0f);
+        aabb_max[current] = make_float4(
+            fmaxf(lmax.x, rmax.x), fmaxf(lmax.y, rmax.y), fmaxf(lmax.z, rmax.z), 0.0f);
         __threadfence();
         current = parent[current];
     }
@@ -883,7 +901,8 @@ __global__ static void lbvh_traverse_kernel(
     const int* indices,
     int count,
     const int2* children,
-    const float4* aabb,
+    const float4* aabb_min,
+    const float4* aabb_max,
     float* delta_vx,
     float* delta_vy,
     float* delta_vz,
@@ -901,8 +920,10 @@ __global__ static void lbvh_traverse_kernel(
     const DeviceBall self = balls[obj_idx];
     const float my_min_x = self.x - self.radius;
     const float my_min_y = self.y - self.radius;
+    const float my_min_z = self.z - self.radius;
     const float my_max_x = self.x + self.radius;
     const float my_max_y = self.y + self.radius;
+    const float my_max_z = self.z + self.radius;
 
     // A Karras LBVH over N leaves has depth ~ceil(log2 N) (the i^j index
     // tie-break keeps runs of duplicate Morton codes balanced rather than
@@ -918,9 +939,11 @@ __global__ static void lbvh_traverse_kernel(
 
     while (stack_ptr > 0) {
         const int node = stack[--stack_ptr];
-        const float4 box = aabb[node];
-        if (my_max_x < box.x || my_min_x > box.z
-            || my_max_y < box.y || my_min_y > box.w) {
+        const float4 bmin = aabb_min[node];
+        const float4 bmax = aabb_max[node];
+        if (my_max_x < bmin.x || my_min_x > bmax.x
+            || my_max_y < bmin.y || my_min_y > bmax.y
+            || my_max_z < bmin.z || my_min_z > bmax.z) {
             continue;
         }
         if (node >= count - 1) {
@@ -1505,7 +1528,7 @@ static void run_lbvh(int blocks, int threads) {
 
     lbvh_morton_kernel<<<blocks, threads>>>(
         g_balls, g_lbvh_morton, g_lbvh_indices,
-        g_object_count, (float)g_width, (float)g_height);
+        g_object_count, (float)g_width, (float)g_height, g_depth);
     CUDA_CHECK(cudaGetLastError());
 
     thrust::device_ptr<unsigned int> morton_ptr(g_lbvh_morton);
@@ -1522,12 +1545,13 @@ static void run_lbvh(int blocks, int threads) {
 
     lbvh_aabbs_kernel<<<blocks, threads>>>(
         g_balls, g_lbvh_indices, g_object_count,
-        g_lbvh_parent, g_lbvh_children, g_lbvh_flags, g_lbvh_aabb);
+        g_lbvh_parent, g_lbvh_children, g_lbvh_flags,
+        g_lbvh_aabb_min, g_lbvh_aabb_max);
     CUDA_CHECK(cudaGetLastError());
 
     lbvh_traverse_kernel<<<blocks, threads>>>(
         g_balls, g_lbvh_indices, g_object_count,
-        g_lbvh_children, g_lbvh_aabb,
+        g_lbvh_children, g_lbvh_aabb_min, g_lbvh_aabb_max,
         g_collision_delta_vx, g_collision_delta_vy, g_collision_delta_vz,
         g_collision_delta_x, g_collision_delta_y, g_collision_delta_z,
         g_collision_count, g_candidate_pair_count);
@@ -1643,7 +1667,8 @@ extern "C" int cuda_visualizer_create(unsigned int vbo, int object_count, int wi
     const size_t lbvh_nodes = (size_t)object_count * 2 - 1;
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_morton, (size_t)object_count * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_indices, (size_t)object_count * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb, lbvh_nodes * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_min, lbvh_nodes * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc((void**)&g_lbvh_aabb_max, lbvh_nodes * sizeof(float4)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_children, lbvh_nodes * sizeof(int2)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_parent, lbvh_nodes * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&g_lbvh_flags, lbvh_nodes * sizeof(int)));
@@ -1744,9 +1769,13 @@ extern "C" void cuda_visualizer_destroy(void) {
         CUDA_CHECK(cudaFree(g_lbvh_indices));
         g_lbvh_indices = NULL;
     }
-    if (g_lbvh_aabb != NULL) {
-        CUDA_CHECK(cudaFree(g_lbvh_aabb));
-        g_lbvh_aabb = NULL;
+    if (g_lbvh_aabb_min != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb_min));
+        g_lbvh_aabb_min = NULL;
+    }
+    if (g_lbvh_aabb_max != NULL) {
+        CUDA_CHECK(cudaFree(g_lbvh_aabb_max));
+        g_lbvh_aabb_max = NULL;
     }
     if (g_lbvh_children != NULL) {
         CUDA_CHECK(cudaFree(g_lbvh_children));
